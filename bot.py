@@ -36,6 +36,7 @@ class Config:
     list_channel_id: int
     preview_lines: int
     history_limit: int | None
+    keep_seconds: float  # how long an event stays listed after it starts
 
 
 def load_config() -> Config:
@@ -50,6 +51,7 @@ def load_config() -> Config:
         list_channel_id=int(os.environ["LIST_CHANNEL_ID"]),
         preview_lines=int(os.getenv("PREVIEW_LINES", "3")),
         history_limit=int(history) if history else None,
+        keep_seconds=float(os.getenv("KEEP_AFTER_START_HOURS", "4")) * 3600,
     )
     if config.source_channel_id == config.list_channel_id:
         sys.exit("SOURCE_CHANNEL_ID and LIST_CHANNEL_ID must be different channels")
@@ -108,9 +110,9 @@ def render_entry(entry: Entry) -> str:
     return "\n".join(lines)
 
 
-def upcoming(entries: Iterable[Entry], now: float) -> list[Entry]:
-    """Entries whose (start) time hasn't passed yet."""
-    return [e for e in entries if e.timestamp > now]
+def upcoming(entries: Iterable[Entry], now: float, keep_seconds: float) -> list[Entry]:
+    """Entries that haven't started yet, or started less than keep_seconds ago."""
+    return [e for e in entries if e.timestamp + keep_seconds > now]
 
 
 def render_pages(entries: Iterable[Entry]) -> list[str]:
@@ -254,7 +256,7 @@ class HaskhaBot(discord.Client):
                 await asyncio.wait_for(self.dirty.wait(), timeout=self.seconds_until_next_expiry())
                 await asyncio.sleep(DEBOUNCE_SECONDS)  # batch bursts of changes into one update
             except asyncio.TimeoutError:
-                pass  # the next event has started: re-render to drop it
+                pass  # the oldest listed event has expired: re-render to drop it
             self.dirty.clear()
             try:
                 await self.sync_list()
@@ -263,16 +265,17 @@ class HaskhaBot(discord.Client):
 
     def seconds_until_next_expiry(self) -> float:
         now = time.time()
-        pending = [e.timestamp for e in upcoming(self.entries.values(), now)]
-        if not pending:
+        keep = self.config.keep_seconds
+        expiries = [e.timestamp + keep for e in upcoming(self.entries.values(), now, keep)]
+        if not expiries:
             return MAX_WAIT_SECONDS
-        return min(min(pending) - now + 1, MAX_WAIT_SECONDS)
+        return min(min(expiries) - now + 1, MAX_WAIT_SECONDS)
 
     async def sync_list(self) -> None:
         if self.target is None:
             return
         async with self.lock:
-            pages = render_pages(upcoming(self.entries.values(), time.time()))
+            pages = render_pages(upcoming(self.entries.values(), time.time(), self.config.keep_seconds))
             for i, page in enumerate(pages):
                 embed = discord.Embed(
                     title=LIST_TITLE if i == 0 else None,

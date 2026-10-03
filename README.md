@@ -1,7 +1,8 @@
 # haskhabot
 
 Watches a channel for posts containing Discord timestamps (`<t:1760000000:F>`) and keeps a
-sorted list of them in another channel: time · author · first lines · link.
+sorted list of them in another channel: time · author · first lines · link. Events drop off the
+list 4 hours after they start (configurable).
 
 The bot keeps no database. On startup it rescans the source channel, then follows new, edited and
 deleted posts, editing its own list messages in place.
@@ -34,6 +35,7 @@ or a compose `env_file:`.
 | `LIST_CHANNEL_ID` | Channel the list is kept in (required) |
 | `PREVIEW_LINES` | Lines of each post shown in the list (default 3) |
 | `HISTORY_LIMIT` | Messages to scan on startup (default: whole channel) |
+| `KEEP_AFTER_START_HOURS` | How long an event stays listed after it starts (default 4) |
 
 ## Run
 
