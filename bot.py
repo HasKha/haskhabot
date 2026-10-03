@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -23,6 +24,7 @@ EMBED_LIMIT = 4096  # max characters in an embed description
 DEBOUNCE_SECONDS = 2.0
 LIST_TITLE = "Events"
 RETRY_SECONDS = 60
+MAX_WAIT_SECONDS = 3600  # re-render at least hourly, as a safety net
 SOURCE_PERMISSIONS = ("view_channel", "read_message_history")
 LIST_PERMISSIONS = ("view_channel", "read_message_history", "send_messages", "embed_links")
 
@@ -106,6 +108,11 @@ def render_entry(entry: Entry) -> str:
     return "\n".join(lines)
 
 
+def upcoming(entries: Iterable[Entry], now: float) -> list[Entry]:
+    """Entries whose (start) time hasn't passed yet."""
+    return [e for e in entries if e.timestamp > now]
+
+
 def render_pages(entries: Iterable[Entry]) -> list[str]:
     """Render the sorted list, split into chunks that each fit in one embed."""
     pages: list[str] = []
@@ -118,7 +125,7 @@ def render_pages(entries: Iterable[Entry]) -> list[str]:
             current = block
         else:
             current = candidate
-    pages.append(current or "No timestamped posts found yet.")
+    pages.append(current or "No upcoming events.")
     return pages
 
 
@@ -243,19 +250,29 @@ class HaskhaBot(discord.Client):
     async def run_updater(self) -> None:
         await self.wait_until_ready()
         while not self.is_closed():
-            await self.dirty.wait()
-            await asyncio.sleep(DEBOUNCE_SECONDS)  # batch bursts of changes into one update
+            try:
+                await asyncio.wait_for(self.dirty.wait(), timeout=self.seconds_until_next_expiry())
+                await asyncio.sleep(DEBOUNCE_SECONDS)  # batch bursts of changes into one update
+            except asyncio.TimeoutError:
+                pass  # the next event has started: re-render to drop it
             self.dirty.clear()
             try:
                 await self.sync_list()
             except Exception:
                 log.exception("Failed to update the list channel")
 
+    def seconds_until_next_expiry(self) -> float:
+        now = time.time()
+        pending = [e.timestamp for e in upcoming(self.entries.values(), now)]
+        if not pending:
+            return MAX_WAIT_SECONDS
+        return min(min(pending) - now + 1, MAX_WAIT_SECONDS)
+
     async def sync_list(self) -> None:
         if self.target is None:
             return
         async with self.lock:
-            pages = render_pages(self.entries.values())
+            pages = render_pages(upcoming(self.entries.values(), time.time()))
             for i, page in enumerate(pages):
                 embed = discord.Embed(
                     title=LIST_TITLE if i == 0 else None,
