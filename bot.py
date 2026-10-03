@@ -138,11 +138,22 @@ class HaskhaBot(discord.Client):
     async def on_ready(self) -> None:
         # Fires again after a full reconnect, so rescanning here also catches anything missed offline.
         log.info("Logged in as %s", self.user)
+        await self.rescan()
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        log.info("Joined server %s", guild.name)
+        await self.rescan()
+
+    async def rescan(self) -> None:
         self.source = self.get_channel(self.config.source_channel_id)
         self.target = self.get_channel(self.config.list_channel_id)
         if not isinstance(self.source, discord.abc.Messageable) or not isinstance(self.target, discord.abc.Messageable):
-            log.error("Can't see the source and/or list channel: check the IDs and the bot's permissions")
-            await self.close()
+            # Stay connected rather than exiting: a restart loop would burn through Discord's login limit.
+            log.error(
+                "Can't see the source and/or list channel: check the IDs, that the bot is in the server, "
+                "and its permissions. Waiting until it joins a server."
+            )
+            self.source = self.target = None
             return
 
         async with self.lock:
@@ -208,6 +219,8 @@ class HaskhaBot(discord.Client):
                 log.exception("Failed to update the list channel")
 
     async def sync_list(self) -> None:
+        if self.target is None:
+            return
         async with self.lock:
             pages = render_pages(self.entries.values())
             for i, page in enumerate(pages):
