@@ -22,6 +22,9 @@ TIMESTAMP_RE = re.compile(r"<t:(-?\d+)(?::[a-zA-Z])?>")
 EMBED_LIMIT = 4096  # max characters in an embed description
 DEBOUNCE_SECONDS = 2.0
 LIST_TITLE = "Events"
+RETRY_SECONDS = 60
+SOURCE_PERMISSIONS = ("view_channel", "read_message_history")
+LIST_PERMISSIONS = ("view_channel", "read_message_history", "send_messages", "embed_links")
 
 
 @dataclass(frozen=True)
@@ -134,36 +137,66 @@ class HaskhaBot(discord.Client):
         self.lock = asyncio.Lock()
         self.dirty = asyncio.Event()
         self.updater = asyncio.create_task(self.run_updater())
+        self.retrier = asyncio.create_task(self.retry_setup())
+        self.last_problems: list[str] = []
 
     async def on_ready(self) -> None:
         # Fires again after a full reconnect, so rescanning here also catches anything missed offline.
         log.info("Logged in as %s", self.user)
         await self.rescan()
 
-    async def on_guild_join(self, guild: discord.Guild) -> None:
-        log.info("Joined server %s", guild.name)
-        await self.rescan()
+    async def retry_setup(self) -> None:
+        # Stay connected and retry rather than exiting: a restart loop would burn through Discord's
+        # login limit. Retrying also picks up permission changes, which the bot gets no event for.
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(RETRY_SECONDS)
+            if self.target is None:
+                try:
+                    await self.rescan()
+                except Exception:
+                    log.exception("Rescan failed")
+
+    def check_channels(self) -> list[str]:
+        """Return what's stopping the bot from working, or an empty list if nothing is."""
+        problems = []
+        for label, channel_id, needed in (
+            ("source", self.config.source_channel_id, SOURCE_PERMISSIONS),
+            ("list", self.config.list_channel_id, LIST_PERMISSIONS),
+        ):
+            channel = self.get_channel(channel_id)
+            if not isinstance(channel, discord.abc.GuildChannel) or not isinstance(channel, discord.abc.Messageable):
+                problems.append(f"{label} channel {channel_id} not found (wrong ID, or the bot isn't in that server)")
+                continue
+            granted = channel.permissions_for(channel.guild.me)
+            missing = [name for name in needed if not getattr(granted, name)]
+            if missing:
+                problems.append(f"missing permissions in #{channel.name} ({label}): {', '.join(missing)}")
+        return problems
 
     async def rescan(self) -> None:
-        self.source = self.get_channel(self.config.source_channel_id)
-        self.target = self.get_channel(self.config.list_channel_id)
-        if not isinstance(self.source, discord.abc.Messageable) or not isinstance(self.target, discord.abc.Messageable):
-            # Stay connected rather than exiting: a restart loop would burn through Discord's login limit.
-            log.error(
-                "Can't see the source and/or list channel: check the IDs, that the bot is in the server, "
-                "and its permissions. Waiting until it joins a server."
-            )
+        problems = self.check_channels()
+        if problems:
+            if problems != self.last_problems:
+                for problem in problems:
+                    log.error(problem)
+                log.error("Retrying every %d seconds", RETRY_SECONDS)
+            self.last_problems = problems
             self.source = self.target = None
             return
+        self.last_problems = []
+        source = self.get_channel(self.config.source_channel_id)
+        target = self.get_channel(self.config.list_channel_id)
 
         async with self.lock:
             self.list_messages = [
-                m async for m in self.target.history(limit=100, oldest_first=True) if m.author == self.user
+                m async for m in target.history(limit=100, oldest_first=True) if m.author == self.user
             ]
             self.entries.clear()
-            async for message in self.source.history(limit=self.config.history_limit):
+            async for message in source.history(limit=self.config.history_limit):
                 self.ingest(message)
-        log.info("Found %d timestamped posts", len(self.entries))
+            self.source, self.target = source, target
+        log.info("Watching #%s, list in #%s: found %d timestamped posts", source.name, target.name, len(self.entries))
         self.dirty.set()
 
     def ingest(self, message: discord.Message) -> bool:
