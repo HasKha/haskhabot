@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import contextlib
+import json
 import logging
 import os
 import random
@@ -11,6 +13,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 import discord
@@ -33,6 +36,45 @@ RETRY_SECONDS = 60
 MAX_WAIT_SECONDS = 3600  # re-render at least hourly, as a safety net
 SOURCE_PERMISSIONS = ("view_channel", "read_message_history")
 LIST_PERMISSIONS = ("view_channel", "read_message_history", "send_messages", "embed_links")
+
+
+@dataclass(frozen=True)
+class MappingConfig:
+    source_id: int
+    list_id: int
+
+
+def read_mappings(path: Path, env: collections.abc.Mapping[str, str]) -> tuple[MappingConfig, ...]:
+    """Mappings from the JSON file, else from the legacy SOURCE_CHANNEL_ID/LIST_CHANNEL_ID pair.
+
+    Raises ValueError with a readable message if there are none or they're invalid.
+    """
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))  # -sig: Notepad adds a BOM
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{path} is not valid JSON: {e}") from e
+        if not isinstance(raw, list) or not raw:
+            raise ValueError(f'{path} must be a non-empty list of {{"source": ..., "list": ...}} objects')
+        mappings = []
+        for i, item in enumerate(raw, 1):
+            # type() is int, not isinstance: rejects "123" strings and true/false.
+            if not isinstance(item, dict) or not all(type(item.get(k)) is int for k in ("source", "list")):
+                raise ValueError(f'{path} entry {i} needs integer "source" and "list" channel IDs (no quotes)')
+            mappings.append(MappingConfig(item["source"], item["list"]))
+    elif env.get("SOURCE_CHANNEL_ID") and env.get("LIST_CHANNEL_ID"):
+        mappings = [MappingConfig(int(env["SOURCE_CHANNEL_ID"]), int(env["LIST_CHANNEL_ID"]))]
+    else:
+        raise ValueError(f"No mappings: create {path} or set SOURCE_CHANNEL_ID and LIST_CHANNEL_ID")
+
+    ids = [i for m in mappings for i in (m.source_id, m.list_id)]
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    if repeated:
+        raise ValueError(
+            "Every channel ID must be unique across all sources and lists; repeated: "
+            + ", ".join(map(str, repeated))
+        )
+    return tuple(mappings)
 
 
 @dataclass(frozen=True)
