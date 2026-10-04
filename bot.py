@@ -20,6 +20,8 @@ log = logging.getLogger("haskhabot")
 
 # Discord timestamp markup, e.g. <t:1700000000> or <t:1700000000:F>.
 TIMESTAMP_RE = re.compile(r"<t:(-?\d+)(?::[a-zA-Z])?>")
+# "on fill": starts as soon as enough people join. Listed at the time it was posted.
+ON_FILL_RE = re.compile(r"\bon[\s-]?fill\b", re.IGNORECASE)
 
 EMBED_LIMIT = 4096  # max characters in an embed description
 DEBOUNCE_SECONDS = 2.0
@@ -64,14 +66,23 @@ class Entry:
     timestamp: int
     author_id: int
     preview: str
-    url: str
+    url: str  # the original post, for forwards
     message_id: int
+    on_fill: bool = False  # listed by "on fill" rather than a timestamp
+    forwarded: bool = False
 
 
 def message_text(message: discord.Message) -> str:
-    """Content plus embed text, so posts made by other event bots are picked up too."""
+    """Content plus embed text, so posts made by other event bots are picked up too.
+
+    Forwarded messages have no content of their own; their text is in the snapshot of the original.
+    """
     parts = [message.content]
-    for embed in message.embeds:
+    embeds = list(message.embeds)
+    for snapshot in message.message_snapshots:
+        parts.append(snapshot.content)
+        embeds += snapshot.embeds
+    for embed in embeds:
         parts += [embed.title or "", embed.description or ""]
         for field in embed.fields:
             parts += [field.name or "", field.value or ""]
@@ -92,17 +103,31 @@ def make_preview(text: str, max_lines: int, width: int = 120) -> str:
     return "\n".join(lines)
 
 
+def forwarded_from(message: discord.Message) -> discord.MessageReference | None:
+    ref = message.reference
+    if ref is not None and ref.type is discord.MessageReferenceType.forward:
+        return ref
+    return None
+
+
 def extract_entry(message: discord.Message, preview_lines: int) -> Entry | None:
     text = message_text(message)
     stamps = [int(s) for s in TIMESTAMP_RE.findall(text)]
+    posted = int(message.created_at.timestamp())
+    if ON_FILL_RE.search(text):
+        stamps.append(posted)
     if not stamps:
         return None
+    timestamp = min(stamps)  # e.g. "<start> - <end>" lists under the start time
+    forward = forwarded_from(message)
     return Entry(
-        timestamp=min(stamps),  # e.g. "<start> - <end>" lists under the start time
+        timestamp=timestamp,
         author_id=message.author.id,
         preview=make_preview(text, preview_lines),
-        url=message.jump_url,
+        url=forward.jump_url if forward else message.jump_url,
         message_id=message.id,
+        on_fill=timestamp == posted and bool(ON_FILL_RE.search(text)),
+        forwarded=forward is not None,
     )
 
 
@@ -114,7 +139,9 @@ def pick_emoji(entry: Entry, emojis: Sequence[str]) -> str:
 def render_entry(entry: Entry, emoji: str = "") -> str:
     ts = entry.timestamp
     prefix = f"{emoji} " if emoji else ""
-    lines = [f"{prefix}**<t:{ts}:f>** (<t:{ts}:R>) · <@{entry.author_id}> · [jump]({entry.url})"]
+    when = f"**On fill** (posted <t:{ts}:R>)" if entry.on_fill else f"**<t:{ts}:f>** (<t:{ts}:R>)"
+    who = f"fwd by <@{entry.author_id}>" if entry.forwarded else f"<@{entry.author_id}>"
+    lines = [f"{prefix}{when} · {who} · [jump]({entry.url})"]
     lines += [f"> {line}" for line in entry.preview.splitlines()]
     return "\n".join(lines)
 
