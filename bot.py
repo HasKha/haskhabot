@@ -6,11 +6,12 @@ import asyncio
 import contextlib
 import logging
 import os
+import random
 import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import discord
 from dotenv import load_dotenv
@@ -64,6 +65,7 @@ class Entry:
     author_id: int
     preview: str
     url: str
+    message_id: int
 
 
 def message_text(message: discord.Message) -> str:
@@ -100,12 +102,19 @@ def extract_entry(message: discord.Message, preview_lines: int) -> Entry | None:
         author_id=message.author.id,
         preview=make_preview(text, preview_lines),
         url=message.jump_url,
+        message_id=message.id,
     )
 
 
-def render_entry(entry: Entry) -> str:
+def pick_emoji(entry: Entry, emojis: Sequence[str]) -> str:
+    """A random emoji, seeded by the message so it stays the same across re-renders."""
+    return random.Random(entry.message_id).choice(emojis) if emojis else ""
+
+
+def render_entry(entry: Entry, emoji: str = "") -> str:
     ts = entry.timestamp
-    lines = [f"**<t:{ts}:f>** (<t:{ts}:R>) · <@{entry.author_id}> · [jump]({entry.url})"]
+    prefix = f"{emoji} " if emoji else ""
+    lines = [f"{prefix}**<t:{ts}:f>** (<t:{ts}:R>) · <@{entry.author_id}> · [jump]({entry.url})"]
     lines += [f"> {line}" for line in entry.preview.splitlines()]
     return "\n".join(lines)
 
@@ -115,12 +124,12 @@ def upcoming(entries: Iterable[Entry], now: float, keep_seconds: float) -> list[
     return [e for e in entries if e.timestamp + keep_seconds > now]
 
 
-def render_pages(entries: Iterable[Entry]) -> list[str]:
+def render_pages(entries: Iterable[Entry], emojis: Sequence[str] = ()) -> list[str]:
     """Render the sorted list, split into chunks that each fit in one embed."""
     pages: list[str] = []
     current = ""
     for entry in sorted(entries, key=lambda e: (e.timestamp, e.url)):
-        block = render_entry(entry)
+        block = render_entry(entry, pick_emoji(entry, emojis))
         candidate = f"{current}\n\n{block}" if current else block
         if len(candidate) > EMBED_LIMIT and current:
             pages.append(current)
@@ -237,6 +246,15 @@ class HaskhaBot(discord.Client):
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
         self.forget(payload.message_ids, payload.channel_id)
 
+    async def on_guild_emojis_update(self, guild: discord.Guild, before, after) -> None:
+        if self.target is not None and guild == self.target.guild:
+            self.dirty.set()
+
+    def server_emojis(self) -> list[str]:
+        """The list channel's server's custom emojis, as message markup, in a stable order."""
+        emojis = sorted(self.target.guild.emojis, key=lambda e: e.id)
+        return [str(e) for e in emojis if e.is_usable()]
+
     def forget(self, message_ids: set[int], channel_id: int) -> None:
         if channel_id == self.config.source_channel_id:
             removed = [self.entries.pop(i) for i in message_ids if i in self.entries]
@@ -275,7 +293,8 @@ class HaskhaBot(discord.Client):
         if self.target is None:
             return
         async with self.lock:
-            pages = render_pages(upcoming(self.entries.values(), time.time(), self.config.keep_seconds))
+            listed = upcoming(self.entries.values(), time.time(), self.config.keep_seconds)
+            pages = render_pages(listed, self.server_emojis())
             for i, page in enumerate(pages):
                 embed = discord.Embed(
                     title=LIST_TITLE if i == 0 else None,
