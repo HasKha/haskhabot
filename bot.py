@@ -197,7 +197,7 @@ class HaskhaBot(discord.Client):
         self.lock = asyncio.Lock()
         self.dirty = asyncio.Event()
         self.updater = asyncio.create_task(self.run_updater())
-        self.retrier = asyncio.create_task(self.retry_setup())
+        self.watcher = asyncio.create_task(self.watch_access())
         self.last_problems: list[str] = []
 
     async def on_ready(self) -> None:
@@ -205,17 +205,21 @@ class HaskhaBot(discord.Client):
         log.info("Logged in as %s", self.user)
         await self.rescan()
 
-    async def retry_setup(self) -> None:
+    async def watch_access(self) -> None:
         # Stay connected and retry rather than exiting: a restart loop would burn through Discord's
-        # login limit. Retrying also picks up permission changes, which the bot gets no event for.
+        # login limit. Polling also picks up permission changes, which the bot gets no event for:
+        # losing access (e.g. a channel re-synced with its category) stops message events silently.
         await self.wait_until_ready()
         while not self.is_closed():
             await asyncio.sleep(RETRY_SECONDS)
-            if self.target is None:
-                try:
-                    await self.rescan()
-                except Exception:
-                    log.exception("Rescan failed")
+            try:
+                if self.target is None:
+                    await self.rescan()  # waiting for access: full rescan once it's back
+                elif self.check_channels():
+                    log.error("Lost access to the channels")
+                    await self.rescan()  # logs what's missing and waits for a fix
+            except Exception:
+                log.exception("Rescan failed")
 
     def check_channels(self) -> list[str]:
         """Return what's stopping the bot from working, or an empty list if nothing is."""
