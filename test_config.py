@@ -3,8 +3,9 @@
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
-from bot import MappingConfig, read_mappings
+from bot import Config, Entry, Mapping, MappingConfig, read_mappings
 
 
 def load(data, env=None):
@@ -85,6 +86,23 @@ def test_env_fallback_still_validated():
 def test_file_wins_over_env():
     got = load([{"source": 1, "list": 2}], {"SOURCE_CHANNEL_ID": "5", "LIST_CHANNEL_ID": "6"})
     assert got == (MappingConfig(1, 2),)
+
+
+def test_forget_routes_by_channel():
+    config = Config(token="x", mappings=(), preview_lines=3, history_limit=None, keep_seconds=0)
+    m = Mapping(None, MappingConfig(1, 2), config)
+    m.entries[5] = Entry(timestamp=1, author_id=1, preview="", url="u", message_id=5)
+    m.list_messages = [SimpleNamespace(id=7), SimpleNamespace(id=8)]
+
+    m.forget({5}, 3)  # some other channel: ignored
+    assert 5 in m.entries and not m.dirty.is_set()
+
+    m.forget({5}, 1)  # source channel: the entry is dropped
+    assert not m.entries and m.dirty.is_set()
+
+    m.dirty.clear()
+    m.forget({7}, 2)  # list channel: our message is dropped
+    assert [x.id for x in m.list_messages] == [8] and m.dirty.is_set()
 
 
 if __name__ == "__main__":
