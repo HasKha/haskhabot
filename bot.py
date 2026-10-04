@@ -22,10 +22,13 @@ log = logging.getLogger("haskhabot")
 TIMESTAMP_RE = re.compile(r"<t:(-?\d+)(?::[a-zA-Z])?>")
 # "on fill": starts as soon as enough people join. Listed at the time it was posted.
 ON_FILL_RE = re.compile(r"\bon[\s-]?fill\b", re.IGNORECASE)
+MENTIONS_ONLY_RE = re.compile(r"(?:<(?:@[!&]?|#)\d+>\s*)+")
+BRAILLE_BLANK = "⠀"
 
 EMBED_LIMIT = 4096  # max characters in an embed description
 DEBOUNCE_SECONDS = 2.0
-LIST_TITLE = "Events"
+EMPTY_TEXT = "No events scheduled"
+EMPTY_EMOJI = "toad_pleasure_pain"  # server emoji appended to EMPTY_TEXT, if it exists
 RETRY_SECONDS = 60
 MAX_WAIT_SECONDS = 3600  # re-render at least hourly, as a safety net
 SOURCE_PERMISSIONS = ("view_channel", "read_message_history")
@@ -72,15 +75,25 @@ class Entry:
     forwarded: bool = False
 
 
+def component_text(components: Iterable) -> list[str]:
+    """Text from layout components (Components V2), which some bots use instead of content/embeds."""
+    parts = []
+    for component in components:
+        if isinstance(component, discord.TextDisplay):
+            parts.append(component.content)
+        parts += component_text(getattr(component, "children", ()))  # containers, sections, rows
+    return parts
+
+
 def message_text(message: discord.Message) -> str:
-    """Content plus embed text, so posts made by other event bots are picked up too.
+    """Content plus embed and component text, so posts made by other event bots are picked up too.
 
     Forwarded messages have no content of their own; their text is in the snapshot of the original.
     """
-    parts = [message.content]
+    parts = [message.content, *component_text(message.components)]
     embeds = list(message.embeds)
     for snapshot in message.message_snapshots:
-        parts.append(snapshot.content)
+        parts += [snapshot.content, *component_text(snapshot.components)]
         embeds += snapshot.embeds
     for embed in embeds:
         parts += [embed.title or "", embed.description or ""]
@@ -92,8 +105,10 @@ def message_text(message: discord.Message) -> str:
 def make_preview(text: str, max_lines: int, width: int = 120) -> str:
     lines = []
     for raw in text.splitlines():
-        line = raw.strip().lstrip("#>").strip()  # heading/quote markers would break the layout
-        if not line:
+        # Blank Braille characters are a common padding trick in bot posts.
+        line = raw.replace(BRAILLE_BLANK, "").strip()
+        line = line.lstrip("#>").strip()  # heading/quote markers would break the layout
+        if not line or MENTIONS_ONLY_RE.fullmatch(line):  # e.g. a role ping on its own line
             continue
         if len(line) > width:
             line = line[: width - 1] + "…"
@@ -151,7 +166,7 @@ def upcoming(entries: Iterable[Entry], now: float, keep_seconds: float) -> list[
     return [e for e in entries if e.timestamp + keep_seconds > now]
 
 
-def render_pages(entries: Iterable[Entry], emojis: Sequence[str] = ()) -> list[str]:
+def render_pages(entries: Iterable[Entry], emojis: Sequence[str] = (), empty_text: str = EMPTY_TEXT) -> list[str]:
     """Render the sorted list, split into chunks that each fit in one embed."""
     pages: list[str] = []
     current = ""
@@ -163,7 +178,7 @@ def render_pages(entries: Iterable[Entry], emojis: Sequence[str] = ()) -> list[s
             current = block
         else:
             current = candidate
-    pages.append(current or "No upcoming events.")
+    pages.append(current or empty_text)
     return pages
 
 
@@ -282,6 +297,10 @@ class HaskhaBot(discord.Client):
         emojis = sorted(self.target.guild.emojis, key=lambda e: e.id)
         return [str(e) for e in emojis if e.is_usable()]
 
+    def empty_text(self) -> str:
+        emoji = discord.utils.get(self.target.guild.emojis, name=EMPTY_EMOJI)
+        return f"{EMPTY_TEXT} {emoji}" if emoji and emoji.is_usable() else EMPTY_TEXT
+
     def forget(self, message_ids: set[int], channel_id: int) -> None:
         if channel_id == self.config.source_channel_id:
             removed = [self.entries.pop(i) for i in message_ids if i in self.entries]
@@ -321,17 +340,13 @@ class HaskhaBot(discord.Client):
             return
         async with self.lock:
             listed = upcoming(self.entries.values(), time.time(), self.config.keep_seconds)
-            pages = render_pages(listed, self.server_emojis())
+            pages = render_pages(listed, self.server_emojis(), self.empty_text())
             for i, page in enumerate(pages):
-                embed = discord.Embed(
-                    title=LIST_TITLE if i == 0 else None,
-                    description=page,
-                    colour=discord.Colour.blurple(),
-                )
+                embed = discord.Embed(description=page, colour=discord.Colour.blurple())
                 if i < len(self.list_messages):
                     message = self.list_messages[i]
                     current = message.embeds[0] if message.embeds else None
-                    if current and current.title == embed.title and current.description == page:
+                    if current and current.title is None and current.description == page:
                         continue
                     self.list_messages[i] = await message.edit(content=None, embed=embed)
                 else:
