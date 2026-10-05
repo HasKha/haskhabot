@@ -127,17 +127,91 @@ def test_forwarded_post_gets_no_reactions_but_is_listed():
     assert message.calls == [] and message.id in m.entries
 
 
-def test_edit_updates_the_list_but_never_reacts():
-    m = mapping()
-    edited = fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5)  # emotes written in by the edit
+def send_then_edit(m, sent, *edits):
+    """Send `sent` to the mapping, then deliver each edited version of it (same message id)."""
+    versions = list(edits)
 
     async def fetch_message(message_id):
-        return edited
+        return versions.pop(0)
 
     m.source = NS(fetch_message=fetch_message)
-    asyncio.run(m.on_edit(NS(channel_id=1, message_id=5)))
-    assert 5 in m.entries and m.dirty.is_set()
+
+    async def run():
+        if sent is not None:
+            await m.on_message(sent)
+        for edited in edits:
+            await m.on_edit(NS(channel_id=1, message_id=edited.id))
+
+    asyncio.run(run())
+
+
+def test_edit_reacts_only_with_emotes_it_added():
+    m = mapping()
+    sent = fake_message(f"{EVENT} {SHIELD}", mid=5)
+    edited = fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5)
+    send_then_edit(m, sent, edited)
+    assert sent.calls == [SHIELD] and edited.calls == [HEART]
+    assert 5 in m.entries and m.dirty.is_set()  # the list is updated too
+
+
+def test_repeated_edits_without_new_emotes_cost_nothing():
+    # e.g. an LFG bot updating its signup count on every signup
+    m = mapping()
+    sent = fake_message(f"{EVENT} {SHIELD} {CUSTOM}", mid=5, fail=(CUSTOM,))  # CUSTOM can't be used
+    edits = [fake_message(f"{EVENT} {SHIELD} {CUSTOM} ({n} signed up)", mid=5, fail=(CUSTOM,)) for n in range(5)]
+    send_then_edit(m, sent, *edits)
+    assert sent.calls == [SHIELD]
+    assert all(e.calls == [] for e in edits)  # the failed one isn't retried either
+
+
+def test_renamed_custom_emote_and_variation_selector_are_the_same_emote():
+    m = mapping()
+    sent = fake_message(f"{EVENT} <:tank:111> ⚔️", mid=5)
+    edited = fake_message(f"{EVENT} <:tank_new:111> ⚔", mid=5)  # renamed emoji, selector dropped
+    send_then_edit(m, sent, edited)
     assert edited.calls == []
+
+
+def test_first_edit_of_a_post_from_before_startup_only_records_it():
+    m = mapping()
+    first = fake_message(f"{EVENT} {SHIELD}", mid=5)  # sent before the bot started: not seen
+    second = fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5)
+    send_then_edit(m, None, first, second)
+    assert first.calls == []  # existing posts never get reactions
+    assert second.calls == [HEART]  # but emotes added afterwards do
+
+
+def test_editing_a_chat_message_into_an_event_reacts():
+    m = mapping()
+    sent = fake_message(f"raid tonight? {SHIELD}", mid=5)  # no time yet: not an event
+    edited = fake_message(f"{EVENT} {SHIELD}", mid=5)
+    send_then_edit(m, sent, edited)
+    assert sent.calls == [] and edited.calls == [SHIELD]
+
+
+def test_edited_forward_gets_no_reactions():
+    m = mapping()
+    sent = fake_message(f"{EVENT} {SHIELD}", mid=5, reference=FORWARD)
+    edited = fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5, reference=FORWARD)
+    send_then_edit(m, sent, edited)
+    assert sent.calls == edited.calls == []
+
+
+def test_deleting_a_post_forgets_its_emotes():
+    m = mapping()
+    asyncio.run(m.on_message(fake_message(f"{EVENT} {SHIELD}", mid=5)))
+    m.forget({5}, 1)
+    assert 5 not in m.seen_emotes
+
+
+def test_emote_memory_is_bounded(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "REACTION_MEMORY", 3)
+    m = mapping()
+    for mid in range(1, 6):
+        asyncio.run(m.on_message(fake_message(f"{EVENT} {SHIELD}", mid=mid)))
+    assert list(m.seen_emotes) == [3, 4, 5]
 
 
 def test_rescan_lists_existing_posts_but_never_reacts():

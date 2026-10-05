@@ -73,10 +73,11 @@ The settings below apply to every pair.
 ## Signups
 
 When a post with a time (or "on fill") is sent in a source channel, the bot adds each emote in it, custom
-or unicode, as a reaction, so people can click one to sign up for that role. This happens once, when the
-post is sent: never for forwards, edits, posts made while the bot was offline, or posts that existed
-before it started. An emote the bot can't use (e.g. a custom one from another server) is skipped with
-a warning in the log.
+or unicode, as a reaction, so people can click one to sign up for that role. When the post is edited,
+only emotes the edit added get a reaction. Each emote is tried once per post, so an emote the bot can't
+use (e.g. a custom one from another server) is skipped with one warning in the log, and a bot that keeps
+editing its own post triggers nothing. Forwards never get reactions, and neither do posts that existed
+before the bot started: the first edit the bot sees of such a post only records its emotes.
 
 This needs the **Add Reactions** permission in the source channel. Without it the bot logs one warning,
 doesn't react, and keeps the list and `/listsignups` working; it notices within a minute when the

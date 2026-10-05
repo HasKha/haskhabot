@@ -29,8 +29,10 @@ TIMESTAMP_RE = re.compile(r"<t:(-?\d+)(?::[a-zA-Z])?>")
 ON_FILL_RE = re.compile(r"\bon[\s-]?fill\b", re.IGNORECASE)
 MENTIONS_ONLY_RE = re.compile(r"(?:<(?:@[!&]?|#)\d+>\s*)+")
 BRAILLE_BLANK = "⠀"
-CUSTOM_EMOTE_RE = re.compile(r"<a?:\w+:\d+>")
+CUSTOM_EMOTE_RE = re.compile(r"<a?:\w+:(\d+)>")
 MAX_REACTIONS = 20  # Discord's limit of distinct reactions on one message
+REACTION_MEMORY = 1000  # source posts whose emotes are remembered, to react only to emotes an edit adds
+VARIATION_SELECTOR = "️"
 TAIL_RESERVE = 20  # room kept in a signup line for " …and N more"
 NOT_AN_EVENT_THREAD = "Run this in the thread of an event post."
 
@@ -215,6 +217,12 @@ def find_emotes(text: str) -> list[str]:
     return list(dict.fromkeys(e for _, e in sorted(found)))[:MAX_REACTIONS]
 
 
+def emote_key(mark: str) -> str:
+    """What makes two emotes the same: a custom one's ID (its name can change), unicode without variation selectors."""
+    custom = CUSTOM_EMOTE_RE.fullmatch(mark)
+    return custom.group(1) if custom else mark.replace(VARIATION_SELECTOR, "")
+
+
 def signup_emojis(message: discord.Message) -> list[str]:
     """Emotes to offer as signup reactions: none for forwards, which carry their original's reactions."""
     if forwarded_from(message) or extract_entry(message, 1) is None:
@@ -305,6 +313,9 @@ class Mapping:
         self.dirty = asyncio.Event()
         self.last_problems: list[str] = []
         self.can_react = True  # last known state of the optional Add Reactions permission
+        # Emotes already handled (reacted, failed or predating the bot) per source post, so an edit only
+        # reacts with emotes it added. In memory only, bounded to the most recent posts.
+        self.seen_emotes: collections.OrderedDict[int, set[str]] = collections.OrderedDict()
 
     def check_channels(self) -> list[str]:
         """Return what's stopping this mapping from working, or an empty list if nothing is."""
@@ -396,15 +407,31 @@ class Mapping:
         self.entries[message.id] = entry
         return changed
 
-    async def add_reactions(self, message: discord.Message) -> None:
-        """React with a newly sent post's signup emotes. A failed one is logged and skipped.
+    def remember_emotes(self, message_id: int, keys: set[str]) -> None:
+        self.seen_emotes[message_id] = keys
+        self.seen_emotes.move_to_end(message_id)
+        while len(self.seen_emotes) > REACTION_MEMORY:
+            self.seen_emotes.popitem(last=False)  # forget the least recently sent/edited post
 
-        Only called once per post, when it's sent: never on edits, rescans or startup.
+    async def add_reactions(self, message: discord.Message, *, edited: bool = False) -> None:
+        """React with the post's signup emotes that haven't been handled yet. A failed one is logged and skipped.
+
+        When a post is sent, all its emotes are new. On an edit, only emotes the edit added are: each emote is
+        tried once per post, so a bot that keeps editing its post, or an emote that can't be used, costs nothing.
+        Existing posts never get reactions: rescans don't call this, and the first edit the bot sees of a post
+        it didn't see sent (it predates startup) only records that post's emotes.
         """
         emotes = signup_emojis(message)
-        if not emotes or not self.check_reactions():
+        known = self.seen_emotes.get(message.id)
+        if edited and known is None:
+            self.remember_emotes(message.id, {emote_key(e) for e in emotes})
             return
-        for mark in emotes:
+        known = known or set()
+        new = [e for e in emotes if emote_key(e) not in known]
+        self.remember_emotes(message.id, known | {emote_key(e) for e in new})
+        if not new or not self.check_reactions():
+            return
+        for mark in new:
             try:
                 await message.add_reaction(mark)
             except discord.HTTPException as e:
@@ -425,10 +452,13 @@ class Mapping:
         except discord.NotFound:
             return
         if self.ingest(message):
-            self.dirty.set()  # edits update the list, but never add reactions
+            self.dirty.set()
+        await self.add_reactions(message, edited=True)  # only emotes the edit added
 
     def forget(self, message_ids: set[int], channel_id: int) -> None:
         if channel_id == self.pair.source_id:
+            for i in message_ids:
+                self.seen_emotes.pop(i, None)
             removed = [self.entries.pop(i) for i in message_ids if i in self.entries]
         elif channel_id == self.pair.list_id:
             # Someone deleted one of our list messages; the next sync recreates it.
