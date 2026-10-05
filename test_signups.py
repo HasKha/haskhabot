@@ -151,22 +151,6 @@ def test_signup_rows_counts_what_the_bot_placed_minus_the_bot():
     assert asyncio.run(signup_rows(message, bot_id=99)) == [(SHIELD, [5, 6]), (HEART, [])]
 
 
-def test_signup_rows_includes_post_emotes_people_added_themselves():
-    # e.g. an emote from another server the bot couldn't react with, added by hand
-    message = fake_message(f"{EVENT} {SHIELD} {CUSTOM}", reactions=[reaction(SHIELD, [99, 5]), reaction(CUSTOM, [7, 8], me=False)])
-    assert asyncio.run(signup_rows(message, bot_id=99)) == [(SHIELD, [5]), (CUSTOM, [7, 8])]
-
-
-def test_signup_rows_matches_an_external_emote_by_id_not_name():
-    message = fake_message(f"{EVENT} {CUSTOM}", reactions=[reaction("<:tank_renamed:111>", [7], me=False)])
-    assert asyncio.run(signup_rows(message, bot_id=99)) == [("<:tank_renamed:111>", [7])]
-
-
-def test_signup_rows_matches_unicode_with_or_without_variation_selector():
-    message = fake_message(f"{EVENT} {SHIELD}", reactions=[reaction("\U0001f6e1", [7], me=False)])
-    assert asyncio.run(signup_rows(message, bot_id=99)) == [("\U0001f6e1", [7])]
-
-
 def test_event_in_thread():
     m = mapping()
     m.entries[10] = Entry(timestamp=1, author_id=1, preview="", url="u", message_id=10)

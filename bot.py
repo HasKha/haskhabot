@@ -29,7 +29,7 @@ TIMESTAMP_RE = re.compile(r"<t:(-?\d+)(?::[a-zA-Z])?>")
 ON_FILL_RE = re.compile(r"\bon[\s-]?fill\b", re.IGNORECASE)
 MENTIONS_ONLY_RE = re.compile(r"(?:<(?:@[!&]?|#)\d+>\s*)+")
 BRAILLE_BLANK = "⠀"
-CUSTOM_EMOTE_RE = re.compile(r"<a?:\w+:(\d+)>")  # group 1: the emote's id
+CUSTOM_EMOTE_RE = re.compile(r"<a?:\w+:\d+>")
 MAX_REACTIONS = 20  # Discord's limit of distinct reactions on one message
 TAIL_RESERVE = 20  # room kept in a signup line for " …and N more"
 NOT_AN_EVENT_THREAD = "Run this in the thread of an event post."
@@ -214,12 +214,6 @@ def find_emotes(text: str) -> list[str]:
     return list(dict.fromkeys(e for _, e in sorted(found)))[:MAX_REACTIONS]
 
 
-def emote_key(mark: str) -> str:
-    """Identity of an emote however it's spelled: a custom one by id (names change), unicode minus variation selectors."""
-    custom = CUSTOM_EMOTE_RE.fullmatch(mark)
-    return custom.group(1) if custom else mark.replace("️", "")
-
-
 def signup_emojis(message: discord.Message) -> list[str]:
     """Emotes to offer as signup reactions: none for forwards, which carry their original's reactions."""
     if forwarded_from(message) or extract_entry(message, 1) is None:
@@ -249,18 +243,12 @@ def format_signups(rows: Sequence[tuple[str, Sequence[int]]], limit: int = EMBED
 
 
 async def signup_rows(message: discord.Message, bot_id: int) -> list[tuple[str, list[int]]]:
-    """(emote, user ids) for each signup reaction on the post, without the bot itself.
-
-    A signup reaction is one the bot placed, or one for an emote written in the post: that covers emotes from
-    other servers the bot couldn't react with but people added themselves. A stray thumbs-up isn't a signup.
-    """
-    in_post = {emote_key(mark) for mark in signup_emojis(message)}
+    """(emote, user ids) for each reaction the bot placed on the post, without the bot itself."""
     rows = []
     for r in message.reactions:
-        mark = str(r.emoji)
-        if r.me or emote_key(mark) in in_post:
+        if r.me:  # the bot's own emotes only: a stray thumbs-up isn't a signup
             # A loop, not a nested comprehension: async-inside-comprehension is a SyntaxError before Python 3.11.
-            rows.append((mark, [u.id async for u in r.users() if u.id != bot_id]))
+            rows.append((str(r.emoji), [u.id async for u in r.users() if u.id != bot_id]))
     return rows
 
 

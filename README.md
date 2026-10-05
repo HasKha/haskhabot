@@ -30,8 +30,8 @@ Plain links to messages in other servers can't be read: the bot only sees server
    - Enable **Message Content Intent** (required to read the posts).
    - Optionally turn off **Public Bot** so only you can invite it.
 3. **OAuth2** tab → copy the **Client ID**, then open this URL (replace `CLIENT_ID`) and pick your server:
-   `https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot%20applications.commands&permissions=347200`
-   (View Channels, Send Messages, Embed Links, Read Message History, Add Reactions, Use External Emojis.)
+   `https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot%20applications.commands&permissions=85056`
+   (View Channels, Send Messages, Embed Links, Read Message History, Add Reactions.)
    Already invited the bot? Open the new URL again to re-invite it: the `/listsignups` command and the
    reactions need the extra scope and permissions. The command registers when the bot starts and should show
    up right away; if it doesn't, reload Discord (Ctrl+R) and check the bot's log for "Couldn't register".
@@ -78,11 +78,8 @@ Posts made while the bot was offline get theirs on startup, as long as they're s
 newly written emotes and never remove existing reactions.
 
 In the thread started from an event post, `/listsignups` replies with one line per signup emote: the
-count and who reacted. It lists the emotes the bot placed plus any emote written in the post that people
-added themselves (such as one from another server the bot couldn't react with); other reactions are
-ignored, and the bot itself isn't counted. Anywhere else it tells you to run it in an event's thread.
-Custom emotes are matched by ID, so renaming an emote doesn't matter. The bot can only add a reaction
-for an emote from a server it is in, and needs Use External Emojis for emotes from other servers.
+count and who reacted. Only the bot's own emotes are listed, and the bot itself isn't counted. Anywhere
+else it tells you to run it in an event's thread.
 
 ## Run
 
