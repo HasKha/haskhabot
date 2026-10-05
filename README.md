@@ -77,16 +77,17 @@ python -m venv .venv
 .venv/Scripts/python bot.py
 ```
 
-With Docker:
+With Docker (the image holds only the code; mount the mappings file so it can change without a rebuild):
 
 ```bash
-docker build -t haskhabot .    # copies mappings.json into the image; rebuild after editing it
-docker run -d --name haskhabot --env-file .env --restart unless-stopped haskhabot
+docker build -t haskhabot .
+docker run -d --name haskhabot --env-file .env -v ./mappings.json:/app/mappings.json:ro --restart unless-stopped haskhabot
 ```
 
-The image contains your channel IDs (not secrets, but don't push it to a public registry). To change
-mappings without rebuilding, mount a file over the copy: add
-`-v ./mappings.json:/app/mappings.json:ro` to `docker run`.
+Create `mappings.json` before starting: if it's missing, Docker mounts an empty directory in its
+place and the bot exits with "Can't read /app/mappings.json". With Compose, the same mount is
+`volumes: ["./mappings.json:/app/mappings.json:ro"]`. Leave the mount out to use
+`SOURCE_CHANNEL_ID` / `LIST_CHANNEL_ID` from `.env` instead.
 
 ## Tests
 
