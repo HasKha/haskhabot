@@ -244,11 +244,12 @@ def format_signups(rows: Sequence[tuple[str, Sequence[int]]], limit: int = EMBED
 
 async def signup_rows(message: discord.Message, bot_id: int) -> list[tuple[str, list[int]]]:
     """(emote, user ids) for each reaction the bot placed on the post, without the bot itself."""
-    return [
-        (str(r.emoji), [u.id async for u in r.users() if u.id != bot_id])
-        for r in message.reactions
-        if r.me  # the bot's own emotes only: a stray thumbs-up isn't a signup
-    ]
+    rows = []
+    for r in message.reactions:
+        if r.me:  # the bot's own emotes only: a stray thumbs-up isn't a signup
+            # A loop, not a nested comprehension: async-inside-comprehension is a SyntaxError before Python 3.11.
+            rows.append((str(r.emoji), [u.id async for u in r.users() if u.id != bot_id]))
+    return rows
 
 
 def pick_emoji(entry: Entry, emojis: Sequence[str]) -> str:
@@ -302,6 +303,7 @@ class Mapping:
         self.lock = asyncio.Lock()
         self.dirty = asyncio.Event()
         self.last_problems: list[str] = []
+        self.backfilling: asyncio.Task | None = None  # reactions being added to posts found by the last rescan
 
     def check_channels(self) -> list[str]:
         """Return what's stopping this mapping from working, or an empty list if nothing is."""
@@ -366,8 +368,18 @@ class Mapping:
             self.source, self.target = source, target
         log.info("Watching #%s, list in #%s: found %d timestamped posts", source.name, target.name, len(self.entries))
         self.dirty.set()
-        for message in backfill:  # outside the lock: reacting is slow and the list needn't wait for it
-            await self.add_reactions(message)
+        if self.backfilling is not None:
+            self.backfilling.cancel()  # this rescan supersedes the last one's
+        # A task: reacting is rate-limited and slow, and neither the list nor other mappings should wait for it.
+        self.backfilling = asyncio.create_task(self.backfill(backfill))
+
+    async def backfill(self, messages: list[discord.Message]) -> None:
+        """React to posts that predate the bot or were made while it was offline."""
+        try:
+            for message in messages:
+                await self.add_reactions(message)
+        except Exception:
+            log.exception("[%s] Adding reactions to existing posts failed", self.label)
 
     def ingest(self, message: discord.Message) -> bool:
         """Record or drop a source message. Returns True if the list changed."""
@@ -505,7 +517,7 @@ class HaskhaBot(discord.Client):
 
         try:
             await self.tree.sync()
-        except discord.HTTPException:
+        except Exception:  # any failure, not just HTTP: exiting here would only restart-loop the bot
             log.exception("Couldn't register /listsignups; the list itself keeps working")
 
     async def on_ready(self) -> None:

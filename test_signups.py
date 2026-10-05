@@ -1,12 +1,16 @@
 """Checks for signup reactions and the /listsignups tally. Run: python test_signups.py"""
 
+import ast
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import discord
 
-from bot import Config, Entry, Mapping, MappingConfig, find_emotes, format_signups, signup_emojis, signup_rows
+from bot import (
+    Config, Entry, HaskhaBot, Mapping, MappingConfig, find_emotes, format_signups, signup_emojis, signup_rows,
+)
 
 SHIELD = "\U0001f6e1️"
 HEART = "\U0001f49a"
@@ -157,6 +161,101 @@ def test_event_in_thread():
     assert m.event_in_thread(SimpleNamespace(id=12, parent_id=1)) is None  # not an event post
     assert m.event_in_thread(SimpleNamespace(id=11, parent_id=1)) is None  # a forward
     assert m.event_in_thread(SimpleNamespace(id=1)) is None  # not a thread at all
+
+
+def rescan_mapping(keep_seconds, message):
+    """A Mapping whose source channel holds just `message`, ready for rescan()."""
+
+    async def posts(**kwargs):
+        yield message
+
+    async def nothing(**kwargs):
+        return
+        yield
+
+    channels = {1: SimpleNamespace(name="src", history=posts), 2: SimpleNamespace(name="list", history=nothing)}
+    config = Config(token="x", mappings=(), preview_lines=3, history_limit=None, keep_seconds=keep_seconds)
+    m = Mapping(SimpleNamespace(user=None, get_channel=channels.get), MappingConfig(1, 2), config)
+    m.check_channels = lambda: []
+    return m
+
+
+def test_rescan_returns_before_the_backfill_reactions_finish():
+    message = fake_message(f"{EVENT} {SHIELD}")
+
+    async def run():
+        gate = asyncio.Event()
+
+        async def slow(mark):
+            await gate.wait()
+            message.calls.append(mark)
+
+        message.add_reaction = slow
+        m = rescan_mapping(1e12, message)
+        await asyncio.wait_for(m.rescan(), timeout=1)  # times out if rescan waits for the reactions
+        assert message.calls == []
+        gate.set()
+        await m.backfilling
+        assert message.calls == [SHIELD]
+
+    asyncio.run(run())
+
+
+def test_rescan_does_not_backfill_expired_posts():
+    message = fake_message(f"{EVENT} {SHIELD}")
+
+    async def run():
+        m = rescan_mapping(0, message)
+        await m.rescan()
+        await m.backfilling
+
+    asyncio.run(run())
+    assert message.calls == []
+
+
+def test_a_failing_backfill_is_logged_not_raised():
+    message = fake_message(f"{EVENT} {SHIELD}")
+
+    async def boom(mark):
+        raise RuntimeError("boom")
+
+    message.add_reaction = boom
+
+    async def run():
+        m = rescan_mapping(1e12, message)
+        await m.rescan()
+        await m.backfilling  # would re-raise if the backfill let the error escape
+
+    asyncio.run(run())
+
+
+def test_a_failing_command_sync_does_not_stop_startup():
+    async def run():
+        bot = HaskhaBot(CONFIG)
+
+        async def broken_sync(*args, **kwargs):
+            raise OSError("network down")
+
+        bot.tree.sync = broken_sync
+        try:
+            await bot.setup_hook()
+        finally:
+            for task in [*bot.updaters, bot.watcher]:
+                task.cancel()
+
+    asyncio.run(run())
+
+
+def test_no_async_comprehension_inside_another_comprehension():
+    """A SyntaxError before Python 3.11, which would stop the whole bot starting; the README promises 3.9+."""
+    comps = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8"))
+    for outer in ast.walk(tree):
+        if not isinstance(outer, comps):
+            continue
+        for inner in ast.walk(outer):
+            if inner is not outer and isinstance(inner, comps) and any(g.is_async for g in inner.generators):
+                raise AssertionError(f"bot.py:{inner.lineno}: async comprehension inside a comprehension")
 
 
 if __name__ == "__main__":
