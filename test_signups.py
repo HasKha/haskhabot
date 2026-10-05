@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import discord
 
-from bot import find_emotes, format_signups, signup_emojis
+from bot import Config, Mapping, MappingConfig, find_emotes, format_signups, signup_emojis
 
 SHIELD = "\U0001f6e1️"
 HEART = "\U0001f49a"
@@ -89,6 +89,54 @@ def test_format_signups_truncates_without_hiding_other_emotes():
     assert len(text) <= 400
     assert first.startswith(f"{SHIELD} **1000**:") and "more" in first.split(">")[-1]
     assert second == f"{HEART} **1**: <@5>"
+
+
+CONFIG = Config(token="x", mappings=(), preview_lines=3, history_limit=None, keep_seconds=0)
+
+
+def reaction(mark, user_ids, me=True):
+    async def users():
+        for user_id in user_ids:
+            yield SimpleNamespace(id=user_id)
+
+    return SimpleNamespace(emoji=mark, me=me, users=users)
+
+
+def mapping():
+    return Mapping(None, MappingConfig(1, 2), CONFIG)
+
+
+def test_add_reactions_follows_the_posts_order():
+    message = fake_message(f"{EVENT} {SHIELD} {CUSTOM} {HEART}")
+    asyncio.run(mapping().add_reactions(message))
+    assert message.calls == [SHIELD, CUSTOM, HEART]
+
+
+def test_add_reactions_skips_ones_the_bot_already_added():
+    message = fake_message(f"{EVENT} {SHIELD} {HEART}", reactions=[reaction(SHIELD, [9])])
+    asyncio.run(mapping().add_reactions(message))
+    assert message.calls == [HEART]
+
+
+def test_add_reactions_still_adds_its_own_when_only_a_user_reacted():
+    message = fake_message(f"{EVENT} {SHIELD}", reactions=[reaction(SHIELD, [9], me=False)])
+    asyncio.run(mapping().add_reactions(message))
+    assert message.calls == [SHIELD]
+
+
+def test_add_reactions_carries_on_after_a_failure():
+    message = fake_message(f"{EVENT} {SHIELD} {CUSTOM} {HEART}", fail=(CUSTOM,))
+    asyncio.run(mapping().add_reactions(message))
+    assert message.calls == [SHIELD, HEART]
+
+
+def test_on_message_reacts_only_in_the_source_channel():
+    m = mapping()
+    inside = fake_message(f"{EVENT} {SHIELD}", channel_id=1)
+    outside = fake_message(f"{EVENT} {SHIELD}", channel_id=3)
+    asyncio.run(m.on_message(inside))
+    asyncio.run(m.on_message(outside))
+    assert inside.calls == [SHIELD] and outside.calls == []
 
 
 if __name__ == "__main__":

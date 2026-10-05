@@ -341,6 +341,7 @@ class Mapping:
         source = self.client.get_channel(self.pair.source_id)
         target = self.client.get_channel(self.pair.list_id)
 
+        backfill: list[discord.Message] = []
         async with self.lock:
             self.list_messages = [
                 m async for m in target.history(limit=100, oldest_first=True) if m.author == self.client.user
@@ -348,9 +349,14 @@ class Mapping:
             self.entries.clear()
             async for message in source.history(limit=self.config.history_limit):
                 self.ingest(message)
+                entry = self.entries.get(message.id)
+                if entry and upcoming([entry], time.time(), self.config.keep_seconds):
+                    backfill.append(message)  # still listed: catches posts made while the bot was offline
             self.source, self.target = source, target
         log.info("Watching #%s, list in #%s: found %d timestamped posts", source.name, target.name, len(self.entries))
         self.dirty.set()
+        for message in backfill:  # outside the lock: reacting is slow and the list needn't wait for it
+            await self.add_reactions(message)
 
     def ingest(self, message: discord.Message) -> bool:
         """Record or drop a source message. Returns True if the list changed."""
@@ -361,9 +367,23 @@ class Mapping:
         self.entries[message.id] = entry
         return changed
 
-    def on_message(self, message: discord.Message) -> None:
-        if message.channel.id == self.pair.source_id and self.ingest(message):
+    async def add_reactions(self, message: discord.Message) -> None:
+        """React with the post's signup emotes the bot hasn't added yet. A failed one is logged and skipped."""
+        have = {str(r.emoji) for r in message.reactions if r.me}
+        for mark in signup_emojis(message):
+            if mark in have:
+                continue
+            try:
+                await message.add_reaction(mark)
+            except discord.HTTPException as e:
+                log.warning("[%s] Couldn't react with %s on %s: %s", self.label, mark, message.jump_url, e)
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.channel.id != self.pair.source_id:
+            return
+        if self.ingest(message):
             self.dirty.set()
+        await self.add_reactions(message)
 
     async def on_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
         if payload.channel_id != self.pair.source_id or self.source is None:
@@ -374,6 +394,7 @@ class Mapping:
             return
         if self.ingest(message):
             self.dirty.set()
+        await self.add_reactions(message)  # picks up emotes added by the edit
 
     def forget(self, message_ids: set[int], channel_id: int) -> None:
         if channel_id == self.pair.source_id:
@@ -477,7 +498,7 @@ class HaskhaBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         mapping = self.by_channel.get(message.channel.id)
         if mapping:
-            mapping.on_message(message)
+            await mapping.on_message(message)
 
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
         mapping = self.by_channel.get(payload.channel_id)
