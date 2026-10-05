@@ -9,6 +9,7 @@ import discord
 from discord.components import _component_factory
 
 import bot
+from conftest import FakeChannel
 
 POSTED = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
 HOUR = 3600
@@ -226,15 +227,6 @@ def test_client_constructs_without_running_loop():
 
 
 # --- access monitoring ---
-
-class FakeChannel(discord.abc.GuildChannel, discord.abc.Messageable):
-    def __init__(self, name, **permissions):
-        self.name, self.guild = name, NS(me=object())
-        self._permissions = discord.Permissions(**permissions)
-
-    def permissions_for(self, member):
-        return self._permissions
-
 
 def test_check_channels_reports_missing_permissions():
     full = dict(view_channel=True, read_message_history=True, send_messages=True, embed_links=True)

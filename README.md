@@ -30,8 +30,11 @@ Plain links to messages in other servers can't be read: the bot only sees server
    - Enable **Message Content Intent** (required to read the posts).
    - Optionally turn off **Public Bot** so only you can invite it.
 3. **OAuth2** tab → copy the **Client ID**, then open this URL (replace `CLIENT_ID`) and pick your server:
-   `https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot&permissions=84992`
-   (View Channels, Send Messages, Embed Links, Read Message History.)
+   `https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot%20applications.commands&permissions=85056`
+   (View Channels, Send Messages, Embed Links, Read Message History, Add Reactions.)
+   Already invited the bot? Open the new URL again to re-invite it: the `/listsignups` command and the
+   reactions need the extra scope and permissions. The command registers when the bot starts and should show
+   up right away; if it doesn't, reload Discord (Ctrl+R) and check the bot's log for "Couldn't register".
 4. In Discord: **User Settings → Advanced → Developer Mode** on, then right-click each channel →
    **Copy Channel ID** for each source and list channel you'll put in `mappings.json`.
 
@@ -66,6 +69,23 @@ The settings below apply to every pair.
 | `PREVIEW_LINES` | Lines of each post shown in the list (default 3) |
 | `HISTORY_LIMIT` | Messages to scan on startup (default: whole channel) |
 | `KEEP_AFTER_START_HOURS` | How long an event stays listed after it starts (default 4) |
+
+## Signups
+
+When a post with a time (or "on fill") is sent in a source channel, the bot adds each emote in it, custom
+or unicode, as a reaction, so people can click one to sign up for that role. When the post is edited,
+only emotes the edit added get a reaction. Each emote is tried once per post, so an emote the bot can't
+use (e.g. a custom one from another server) is skipped with one warning in the log, and a bot that keeps
+editing its own post triggers nothing. Forwards never get reactions, and neither do posts that existed
+before the bot started: the first edit the bot sees of such a post only records its emotes.
+
+This needs the **Add Reactions** permission in the source channel. Without it the bot logs one warning,
+doesn't react, and keeps the list and `/listsignups` working; it notices within a minute when the
+permission is granted.
+
+In the thread started from an event post, `/listsignups` replies with one line per signup emote: the
+count and who reacted. Only the bot's own emotes are listed, and the bot itself isn't counted. Anywhere
+else it tells you to run it in an event's thread.
 
 ## Run
 
