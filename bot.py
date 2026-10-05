@@ -18,6 +18,7 @@ from typing import Iterable, Sequence
 
 import discord
 import emoji
+from discord import app_commands
 from dotenv import load_dotenv
 
 log = logging.getLogger("haskhabot")
@@ -31,6 +32,7 @@ BRAILLE_BLANK = "⠀"
 CUSTOM_EMOTE_RE = re.compile(r"<a?:\w+:\d+>")
 MAX_REACTIONS = 20  # Discord's limit of distinct reactions on one message
 TAIL_RESERVE = 20  # room kept in a signup line for " …and N more"
+NOT_AN_EVENT_THREAD = "Run this in the thread of an event post."
 
 EMBED_LIMIT = 4096  # max characters in an embed description
 DEBOUNCE_SECONDS = 2.0
@@ -240,6 +242,15 @@ def format_signups(rows: Sequence[tuple[str, Sequence[int]]], limit: int = EMBED
     return "\n".join(signup_line(mark, user_ids, budget) for mark, user_ids in rows)
 
 
+async def signup_rows(message: discord.Message, bot_id: int) -> list[tuple[str, list[int]]]:
+    """(emote, user ids) for each reaction the bot placed on the post, without the bot itself."""
+    return [
+        (str(r.emoji), [u.id async for u in r.users() if u.id != bot_id])
+        for r in message.reactions
+        if r.me  # the bot's own emotes only: a stray thumbs-up isn't a signup
+    ]
+
+
 def pick_emoji(entry: Entry, emojis: Sequence[str]) -> str:
     """A random emoji, seeded by the message so it stays the same across re-renders."""
     return random.Random(entry.message_id).choice(emojis) if emojis else ""
@@ -408,6 +419,13 @@ class Mapping:
         if removed:
             self.dirty.set()
 
+    def event_in_thread(self, thread) -> Entry | None:
+        """The event post this thread was started from, if it's one of ours (and not a forward)."""
+        if getattr(thread, "parent_id", None) != self.pair.source_id:
+            return None
+        entry = self.entries.get(thread.id)  # a thread started from a message shares its id
+        return None if entry is None or entry.forwarded else entry
+
     def server_emojis(self) -> list[str]:
         """The list channel's server's custom emojis, as message markup, in a stable order."""
         emojis = sorted(self.target.guild.emojis, key=lambda e: e.id)
@@ -471,6 +489,7 @@ class HaskhaBot(discord.Client):
         self.config = config
         self.mappings: list[Mapping] = []
         self.by_channel: dict[int, Mapping] = {}  # source and list channel ids -> their mapping
+        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
         # Built here, not in __init__: asyncio.Lock/Event need the running loop on older Pythons.
@@ -478,6 +497,16 @@ class HaskhaBot(discord.Client):
         self.by_channel = {i: m for m in self.mappings for i in (m.pair.source_id, m.pair.list_id)}
         self.updaters = [asyncio.create_task(m.run_updater()) for m in self.mappings]
         self.watcher = asyncio.create_task(self.watch_access())
+
+        @self.tree.command(name="listsignups", description="List who signed up, by reaction, on this event's post")
+        @app_commands.guild_only()
+        async def listsignups(interaction: discord.Interaction) -> None:
+            await self.list_signups(interaction)
+
+        try:
+            await self.tree.sync()
+        except discord.HTTPException:
+            log.exception("Couldn't register /listsignups; the list itself keeps working")
 
     async def on_ready(self) -> None:
         # Fires again after a full reconnect, so rescanning here also catches anything missed offline.
@@ -494,6 +523,26 @@ class HaskhaBot(discord.Client):
         while not self.is_closed():
             await asyncio.sleep(RETRY_SECONDS)
             await asyncio.gather(*(m.recheck_access() for m in self.mappings))
+
+    async def list_signups(self, interaction: discord.Interaction) -> None:
+        thread = interaction.channel
+        mapping = self.by_channel.get(getattr(thread, "parent_id", None))
+        if mapping is None or mapping.source is None or mapping.event_in_thread(thread) is None:
+            await interaction.response.send_message(NOT_AN_EVENT_THREAD, ephemeral=True)
+            return
+        await interaction.response.defer()  # reading reactions can take longer than Discord's 3 seconds
+        try:
+            message = await mapping.source.fetch_message(thread.id)
+            rows = await signup_rows(message, self.user.id)
+        except discord.HTTPException:
+            log.exception("[%s] Couldn't read signups for %s", mapping.label, thread.id)
+            await interaction.followup.send("Couldn't read that post's reactions.", ephemeral=True)
+            return
+        if not rows:
+            await interaction.followup.send("No signup reactions on this post.")
+            return
+        embed = discord.Embed(description=format_signups(rows), colour=discord.Colour.blurple())
+        await interaction.followup.send(embed=embed)
 
     async def on_message(self, message: discord.Message) -> None:
         mapping = self.by_channel.get(message.channel.id)

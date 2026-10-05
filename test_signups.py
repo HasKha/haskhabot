@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import discord
 
-from bot import Config, Mapping, MappingConfig, find_emotes, format_signups, signup_emojis
+from bot import Config, Entry, Mapping, MappingConfig, find_emotes, format_signups, signup_emojis, signup_rows
 
 SHIELD = "\U0001f6e1️"
 HEART = "\U0001f49a"
@@ -137,6 +137,26 @@ def test_on_message_reacts_only_in_the_source_channel():
     asyncio.run(m.on_message(inside))
     asyncio.run(m.on_message(outside))
     assert inside.calls == [SHIELD] and outside.calls == []
+
+
+def test_signup_rows_counts_what_the_bot_placed_minus_the_bot():
+    message = fake_message(
+        EVENT,
+        reactions=[reaction(SHIELD, [99, 5, 6]), reaction(HEART, [99]), reaction("\U0001f44d", [5], me=False)],
+    )
+    assert asyncio.run(signup_rows(message, bot_id=99)) == [(SHIELD, [5, 6]), (HEART, [])]
+
+
+def test_event_in_thread():
+    m = mapping()
+    m.entries[10] = Entry(timestamp=1, author_id=1, preview="", url="u", message_id=10)
+    m.entries[11] = Entry(timestamp=1, author_id=1, preview="", url="u", message_id=11, forwarded=True)
+
+    assert m.event_in_thread(SimpleNamespace(id=10, parent_id=1)) is m.entries[10]
+    assert m.event_in_thread(SimpleNamespace(id=10, parent_id=2)) is None  # a thread in the list channel
+    assert m.event_in_thread(SimpleNamespace(id=12, parent_id=1)) is None  # not an event post
+    assert m.event_in_thread(SimpleNamespace(id=11, parent_id=1)) is None  # a forward
+    assert m.event_in_thread(SimpleNamespace(id=1)) is None  # not a thread at all
 
 
 if __name__ == "__main__":
