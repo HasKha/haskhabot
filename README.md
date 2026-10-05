@@ -2,9 +2,9 @@
 
 Watches a channel for posts containing Discord timestamps (`<t:1760000000:F>`) and keeps a
 sorted list of them in another channel: time · author · first lines · link. Events drop off the
-list 4 hours after they start (configurable).
+list 4 hours after they start (configurable). Set up as many source → list channel pairs as you like.
 
-The bot keeps no database. On startup it rescans the source channel, then follows new, edited and
+The bot keeps no database. On startup it rescans each source channel, then follows new, edited and
 deleted posts, editing its own list messages in place.
 
 ## What gets listed
@@ -33,21 +33,36 @@ Plain links to messages in other servers can't be read: the bot only sees server
    `https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot&permissions=84992`
    (View Channels, Send Messages, Embed Links, Read Message History.)
 4. In Discord: **User Settings → Advanced → Developer Mode** on, then right-click each channel →
-   **Copy Channel ID** for `SOURCE_CHANNEL_ID` and `LIST_CHANNEL_ID`.
+   **Copy Channel ID** for each source and list channel you'll put in `mappings.json`.
 
 Use a dedicated list channel where only the bot can post: deny **Send Messages** for `@everyone`
 and allow it for the bot.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill it in. With Docker, pass the same file via `--env-file`
-or a compose `env_file:`.
+Copy `.env.example` to `.env` and fill in the token. With Docker, pass the same file via
+`--env-file` or a compose `env_file:`. Copy `mappings.example.json` to `mappings.json`
+(git-ignored) and list your channel pairs:
+
+```json
+[
+  {"source": 111111111111111111, "list": 222222222222222222},
+  {"source": 333333333333333333, "list": 444444444444444444}
+]
+```
+
+Each pair watches one source channel and keeps its list in one list channel. IDs are plain numbers
+(no quotes), and every channel may appear only once in the file, as either a source or a list.
+If one pair can't be reached (wrong ID, missing permissions), the bot logs it and keeps retrying
+while the other pairs carry on. After editing `mappings.json`, restart the bot.
+
+The settings below apply to every pair.
 
 | Variable | |
 |---|---|
 | `DISCORD_TOKEN` | Bot token (required) |
-| `SOURCE_CHANNEL_ID` | Channel to watch (required) |
-| `LIST_CHANNEL_ID` | Channel the list is kept in (required) |
+| `MAPPINGS_FILE` | Path to the mappings file (default: `mappings.json` next to `bot.py`) |
+| `SOURCE_CHANNEL_ID`, `LIST_CHANNEL_ID` | A single pair, used only if there is no `mappings.json` |
 | `PREVIEW_LINES` | Lines of each post shown in the list (default 3) |
 | `HISTORY_LIMIT` | Messages to scan on startup (default: whole channel) |
 | `KEEP_AFTER_START_HOURS` | How long an event stays listed after it starts (default 4) |
@@ -62,12 +77,17 @@ python -m venv .venv
 .venv/Scripts/python bot.py
 ```
 
-With Docker:
+With Docker (the image holds only the code; mount the mappings file so it can change without a rebuild):
 
 ```bash
 docker build -t haskhabot .
-docker run -d --name haskhabot --env-file .env --restart unless-stopped haskhabot
+docker run -d --name haskhabot --env-file .env -v ./mappings.json:/app/mappings.json:ro --restart unless-stopped haskhabot
 ```
+
+Create `mappings.json` before starting: if it's missing, Docker mounts an empty directory in its
+place and the bot exits with "Can't read /app/mappings.json". With Compose, the same mount is
+`volumes: ["./mappings.json:/app/mappings.json:ro"]`. Leave the mount out to use
+`SOURCE_CHANNEL_ID` / `LIST_CHANNEL_ID` from `.env` instead.
 
 ## Tests
 

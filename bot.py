@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import contextlib
+import json
 import logging
 import os
 import random
@@ -11,6 +13,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 import discord
@@ -36,10 +39,58 @@ LIST_PERMISSIONS = ("view_channel", "read_message_history", "send_messages", "em
 
 
 @dataclass(frozen=True)
+class MappingConfig:
+    source_id: int
+    list_id: int
+
+
+def env_channel_id(env: collections.abc.Mapping[str, str], name: str) -> int:
+    try:
+        return int(env[name])
+    except ValueError:
+        raise ValueError(f"{name} must be a channel ID (digits only), got {env[name]!r}") from None
+
+
+def read_mappings(path: Path, env: collections.abc.Mapping[str, str]) -> tuple[MappingConfig, ...]:
+    """Mappings from the JSON file, else from the legacy SOURCE_CHANNEL_ID/LIST_CHANNEL_ID pair.
+
+    Raises ValueError with a readable message if there are none or they're invalid.
+    """
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))  # -sig: Notepad adds a BOM
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{path} is not valid JSON: {e}") from e
+        except (OSError, UnicodeDecodeError) as e:
+            # e.g. a directory: Docker creates one when bind-mounting a host file that doesn't exist.
+            raise ValueError(f"Can't read {path}: {e}") from e
+        if not isinstance(raw, list) or not raw:
+            raise ValueError(f'{path} must be a non-empty list of {{"source": ..., "list": ...}} objects')
+        mappings = []
+        for i, item in enumerate(raw, 1):
+            # type() is int, not isinstance: rejects "123" strings and true/false.
+            if not isinstance(item, dict) or not all(type(item.get(k)) is int for k in ("source", "list")):
+                raise ValueError(f'{path} entry {i} needs integer "source" and "list" channel IDs (no quotes)')
+            mappings.append(MappingConfig(item["source"], item["list"]))
+    elif env.get("SOURCE_CHANNEL_ID") and env.get("LIST_CHANNEL_ID"):
+        mappings = [MappingConfig(env_channel_id(env, "SOURCE_CHANNEL_ID"), env_channel_id(env, "LIST_CHANNEL_ID"))]
+    else:
+        raise ValueError(f"No mappings: create {path} or set SOURCE_CHANNEL_ID and LIST_CHANNEL_ID")
+
+    ids = [i for m in mappings for i in (m.source_id, m.list_id)]
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    if repeated:
+        raise ValueError(
+            "Every channel ID must be unique across all sources and lists; repeated: "
+            + ", ".join(map(str, repeated))
+        )
+    return tuple(mappings)
+
+
+@dataclass(frozen=True)
 class Config:
     token: str
-    source_channel_id: int
-    list_channel_id: int
+    mappings: tuple[MappingConfig, ...]
     preview_lines: int
     history_limit: int | None
     keep_seconds: float  # how long an event stays listed after it starts
@@ -47,21 +98,21 @@ class Config:
 
 def load_config() -> Config:
     load_dotenv()
-    missing = [k for k in ("DISCORD_TOKEN", "SOURCE_CHANNEL_ID", "LIST_CHANNEL_ID") if not os.getenv(k)]
-    if missing:
-        sys.exit(f"Missing required settings in .env: {', '.join(missing)}")
+    if not os.getenv("DISCORD_TOKEN"):
+        sys.exit("Missing required settings in .env: DISCORD_TOKEN")
+    path = Path(os.getenv("MAPPINGS_FILE") or Path(__file__).with_name("mappings.json"))
+    try:
+        mappings = read_mappings(path, os.environ)
+    except ValueError as e:
+        sys.exit(str(e))
     history = os.getenv("HISTORY_LIMIT", "").strip()
-    config = Config(
+    return Config(
         token=os.environ["DISCORD_TOKEN"],
-        source_channel_id=int(os.environ["SOURCE_CHANNEL_ID"]),
-        list_channel_id=int(os.environ["LIST_CHANNEL_ID"]),
+        mappings=mappings,
         preview_lines=int(os.getenv("PREVIEW_LINES", "3")),
         history_limit=int(history) if history else None,
         keep_seconds=float(os.getenv("KEEP_AFTER_START_HOURS", "4")) * 3600,
     )
-    if config.source_channel_id == config.list_channel_id:
-        sys.exit("SOURCE_CHANNEL_ID and LIST_CHANNEL_ID must be different channels")
-    return config
 
 
 @dataclass(frozen=True)
@@ -182,53 +233,30 @@ def render_pages(entries: Iterable[Entry], emojis: Sequence[str] = (), empty_tex
     return pages
 
 
-class HaskhaBot(discord.Client):
-    def __init__(self, config: Config):
-        intents = discord.Intents.default()
-        intents.message_content = True  # privileged: must also be enabled in the Developer Portal
-        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+class Mapping:
+    """One source → list pair: its entries, the list messages we keep, and the sync logic."""
+
+    def __init__(self, client: discord.Client, pair: MappingConfig, config: Config):
+        self.client = client
+        self.pair = pair
         self.config = config
+        self.label = f"{pair.source_id}→{pair.list_id}"
         self.entries: dict[int, Entry] = {}  # source message id -> entry
         self.list_messages: list[discord.Message] = []  # our messages in the list channel, in order
         self.source: discord.abc.Messageable | None = None
         self.target: discord.abc.Messageable | None = None
-
-    async def setup_hook(self) -> None:
         self.lock = asyncio.Lock()
         self.dirty = asyncio.Event()
-        self.updater = asyncio.create_task(self.run_updater())
-        self.watcher = asyncio.create_task(self.watch_access())
         self.last_problems: list[str] = []
 
-    async def on_ready(self) -> None:
-        # Fires again after a full reconnect, so rescanning here also catches anything missed offline.
-        log.info("Logged in as %s", self.user)
-        await self.rescan()
-
-    async def watch_access(self) -> None:
-        # Stay connected and retry rather than exiting: a restart loop would burn through Discord's
-        # login limit. Polling also picks up permission changes, which the bot gets no event for:
-        # losing access (e.g. a channel re-synced with its category) stops message events silently.
-        await self.wait_until_ready()
-        while not self.is_closed():
-            await asyncio.sleep(RETRY_SECONDS)
-            try:
-                if self.target is None:
-                    await self.rescan()  # waiting for access: full rescan once it's back
-                elif self.check_channels():
-                    log.error("Lost access to the channels")
-                    await self.rescan()  # logs what's missing and waits for a fix
-            except Exception:
-                log.exception("Rescan failed")
-
     def check_channels(self) -> list[str]:
-        """Return what's stopping the bot from working, or an empty list if nothing is."""
+        """Return what's stopping this mapping from working, or an empty list if nothing is."""
         problems = []
         for label, channel_id, needed in (
-            ("source", self.config.source_channel_id, SOURCE_PERMISSIONS),
-            ("list", self.config.list_channel_id, LIST_PERMISSIONS),
+            ("source", self.pair.source_id, SOURCE_PERMISSIONS),
+            ("list", self.pair.list_id, LIST_PERMISSIONS),
         ):
-            channel = self.get_channel(channel_id)
+            channel = self.client.get_channel(channel_id)
             if not isinstance(channel, discord.abc.GuildChannel) or not isinstance(channel, discord.abc.Messageable):
                 problems.append(f"{label} channel {channel_id} not found (wrong ID, or the bot isn't in that server)")
                 continue
@@ -238,23 +266,41 @@ class HaskhaBot(discord.Client):
                 problems.append(f"missing permissions in #{channel.name} ({label}): {', '.join(missing)}")
         return problems
 
+    async def rescan_logged(self) -> None:
+        """rescan(), logging failures so they can't affect the other mappings."""
+        try:
+            await self.rescan()
+        except Exception:
+            log.exception("[%s] Rescan failed", self.label)
+
+    async def recheck_access(self) -> None:
+        """Called periodically: rescan when waiting for access, or when access was just lost."""
+        try:
+            if self.target is None:
+                await self.rescan()  # waiting for access: full rescan once it's back
+            elif self.check_channels():
+                log.error("[%s] Lost access to the channels", self.label)
+                await self.rescan()  # logs what's missing and waits for a fix
+        except Exception:
+            log.exception("[%s] Rescan failed", self.label)
+
     async def rescan(self) -> None:
         problems = self.check_channels()
         if problems:
             if problems != self.last_problems:
                 for problem in problems:
-                    log.error(problem)
-                log.error("Retrying every %d seconds", RETRY_SECONDS)
+                    log.error("[%s] %s", self.label, problem)
+                log.error("[%s] Retrying every %d seconds", self.label, RETRY_SECONDS)
             self.last_problems = problems
             self.source = self.target = None
             return
         self.last_problems = []
-        source = self.get_channel(self.config.source_channel_id)
-        target = self.get_channel(self.config.list_channel_id)
+        source = self.client.get_channel(self.pair.source_id)
+        target = self.client.get_channel(self.pair.list_id)
 
         async with self.lock:
             self.list_messages = [
-                m async for m in target.history(limit=100, oldest_first=True) if m.author == self.user
+                m async for m in target.history(limit=100, oldest_first=True) if m.author == self.client.user
             ]
             self.entries.clear()
             async for message in source.history(limit=self.config.history_limit):
@@ -272,12 +318,12 @@ class HaskhaBot(discord.Client):
         self.entries[message.id] = entry
         return changed
 
-    async def on_message(self, message: discord.Message) -> None:
-        if message.channel.id == self.config.source_channel_id and self.ingest(message):
+    def on_message(self, message: discord.Message) -> None:
+        if message.channel.id == self.pair.source_id and self.ingest(message):
             self.dirty.set()
 
-    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
-        if payload.channel_id != self.config.source_channel_id or self.source is None:
+    async def on_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        if payload.channel_id != self.pair.source_id or self.source is None:
             return
         try:
             message = await self.source.fetch_message(payload.message_id)
@@ -286,14 +332,16 @@ class HaskhaBot(discord.Client):
         if self.ingest(message):
             self.dirty.set()
 
-    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
-        self.forget({payload.message_id}, payload.channel_id)
-
-    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
-        self.forget(payload.message_ids, payload.channel_id)
-
-    async def on_guild_emojis_update(self, guild: discord.Guild, before, after) -> None:
-        if self.target is not None and guild == self.target.guild:
+    def forget(self, message_ids: set[int], channel_id: int) -> None:
+        if channel_id == self.pair.source_id:
+            removed = [self.entries.pop(i) for i in message_ids if i in self.entries]
+        elif channel_id == self.pair.list_id:
+            # Someone deleted one of our list messages; the next sync recreates it.
+            removed = [m for m in self.list_messages if m.id in message_ids]
+            self.list_messages = [m for m in self.list_messages if m.id not in message_ids]
+        else:
+            return
+        if removed:
             self.dirty.set()
 
     def server_emojis(self) -> list[str]:
@@ -305,21 +353,9 @@ class HaskhaBot(discord.Client):
         emoji = discord.utils.get(self.target.guild.emojis, name=EMPTY_EMOJI)
         return f"{EMPTY_TEXT} {emoji}" if emoji and emoji.is_usable() else EMPTY_TEXT
 
-    def forget(self, message_ids: set[int], channel_id: int) -> None:
-        if channel_id == self.config.source_channel_id:
-            removed = [self.entries.pop(i) for i in message_ids if i in self.entries]
-        elif channel_id == self.config.list_channel_id:
-            # Someone deleted one of our list messages; the next sync recreates it.
-            removed = [m for m in self.list_messages if m.id in message_ids]
-            self.list_messages = [m for m in self.list_messages if m.id not in message_ids]
-        else:
-            return
-        if removed:
-            self.dirty.set()
-
     async def run_updater(self) -> None:
-        await self.wait_until_ready()
-        while not self.is_closed():
+        await self.client.wait_until_ready()
+        while not self.client.is_closed():
             try:
                 await asyncio.wait_for(self.dirty.wait(), timeout=self.seconds_until_next_expiry())
                 await asyncio.sleep(DEBOUNCE_SECONDS)  # batch bursts of changes into one update
@@ -329,7 +365,7 @@ class HaskhaBot(discord.Client):
             try:
                 await self.sync_list()
             except Exception:
-                log.exception("Failed to update the list channel")
+                log.exception("[%s] Failed to update the list channel", self.label)
 
     def seconds_until_next_expiry(self) -> float:
         now = time.time()
@@ -361,6 +397,64 @@ class HaskhaBot(discord.Client):
             for message in extras:
                 with contextlib.suppress(discord.NotFound):
                     await message.delete()
+
+
+class HaskhaBot(discord.Client):
+    def __init__(self, config: Config):
+        intents = discord.Intents.default()
+        intents.message_content = True  # privileged: must also be enabled in the Developer Portal
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+        self.config = config
+        self.mappings: list[Mapping] = []
+        self.by_channel: dict[int, Mapping] = {}  # source and list channel ids -> their mapping
+
+    async def setup_hook(self) -> None:
+        # Built here, not in __init__: asyncio.Lock/Event need the running loop on older Pythons.
+        self.mappings = [Mapping(self, pair, self.config) for pair in self.config.mappings]
+        self.by_channel = {i: m for m in self.mappings for i in (m.pair.source_id, m.pair.list_id)}
+        self.updaters = [asyncio.create_task(m.run_updater()) for m in self.mappings]
+        self.watcher = asyncio.create_task(self.watch_access())
+
+    async def on_ready(self) -> None:
+        # Fires again after a full reconnect, so rescanning here also catches anything missed offline.
+        log.info("Logged in as %s", self.user)
+        # Concurrently, so a big channel's history scan doesn't delay the other lists.
+        await asyncio.gather(*(m.rescan_logged() for m in self.mappings))
+
+    async def watch_access(self) -> None:
+        # Stay connected and retry rather than exiting: a restart loop would burn through Discord's
+        # login limit. Polling also picks up permission changes, which the bot gets no event for:
+        # losing access (e.g. a channel re-synced with its category) stops message events silently.
+        # Each mapping is handled on its own, so one with a problem doesn't hold up the others.
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(RETRY_SECONDS)
+            await asyncio.gather(*(m.recheck_access() for m in self.mappings))
+
+    async def on_message(self, message: discord.Message) -> None:
+        mapping = self.by_channel.get(message.channel.id)
+        if mapping:
+            mapping.on_message(message)
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        mapping = self.by_channel.get(payload.channel_id)
+        if mapping:
+            await mapping.on_edit(payload)
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        mapping = self.by_channel.get(payload.channel_id)
+        if mapping:
+            mapping.forget({payload.message_id}, payload.channel_id)
+
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
+        mapping = self.by_channel.get(payload.channel_id)
+        if mapping:
+            mapping.forget(payload.message_ids, payload.channel_id)
+
+    async def on_guild_emojis_update(self, guild: discord.Guild, before, after) -> None:
+        for mapping in self.mappings:
+            if mapping.target is not None and guild == mapping.target.guild:
+                mapping.dirty.set()
 
 
 def main() -> None:
