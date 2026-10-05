@@ -1,2 +1,3 @@
 discord.py>=2.6,<3  # 2.5 added forwarded message snapshots, 2.6 layout components
 python-dotenv>=1.0
+emoji>=2.14,<3  # unicode emoji detection (ZWJ sequences, flags, skin tones, keycaps)

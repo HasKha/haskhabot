@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import discord
+import emoji
 from dotenv import load_dotenv
 
 log = logging.getLogger("haskhabot")
@@ -27,6 +28,8 @@ TIMESTAMP_RE = re.compile(r"<t:(-?\d+)(?::[a-zA-Z])?>")
 ON_FILL_RE = re.compile(r"\bon[\s-]?fill\b", re.IGNORECASE)
 MENTIONS_ONLY_RE = re.compile(r"(?:<(?:@[!&]?|#)\d+>\s*)+")
 BRAILLE_BLANK = "⠀"
+CUSTOM_EMOTE_RE = re.compile(r"<a?:\w+:\d+>")
+MAX_REACTIONS = 20  # Discord's limit of distinct reactions on one message
 
 EMBED_LIMIT = 4096  # max characters in an embed description
 DEBOUNCE_SECONDS = 2.0
@@ -195,6 +198,24 @@ def extract_entry(message: discord.Message, preview_lines: int) -> Entry | None:
         on_fill=timestamp == posted and bool(ON_FILL_RE.search(text)),
         forwarded=forward is not None,
     )
+
+
+def find_emotes(text: str) -> list[str]:
+    """Custom and fully-qualified unicode emotes in text: deduplicated, in order of first appearance, at most 20."""
+    found = [(m.start(), m.group()) for m in CUSTOM_EMOTE_RE.finditer(text)]
+    found += [
+        (e["match_start"], e["emoji"])
+        for e in emoji.emoji_list(text)
+        if emoji.EMOJI_DATA[e["emoji"]]["status"] == emoji.STATUS["fully_qualified"]  # not a bare ™ or ©
+    ]
+    return list(dict.fromkeys(e for _, e in sorted(found)))[:MAX_REACTIONS]
+
+
+def signup_emojis(message: discord.Message) -> list[str]:
+    """Emotes to offer as signup reactions: none for forwards, which carry their original's reactions."""
+    if forwarded_from(message) or extract_entry(message, 1) is None:
+        return []
+    return find_emotes(message_text(message))
 
 
 def pick_emoji(entry: Entry, emojis: Sequence[str]) -> str:
