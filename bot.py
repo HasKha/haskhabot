@@ -30,6 +30,7 @@ MENTIONS_ONLY_RE = re.compile(r"(?:<(?:@[!&]?|#)\d+>\s*)+")
 BRAILLE_BLANK = "⠀"
 CUSTOM_EMOTE_RE = re.compile(r"<a?:\w+:\d+>")
 MAX_REACTIONS = 20  # Discord's limit of distinct reactions on one message
+TAIL_RESERVE = 20  # room kept in a signup line for " …and N more"
 
 EMBED_LIMIT = 4096  # max characters in an embed description
 DEBOUNCE_SECONDS = 2.0
@@ -216,6 +217,27 @@ def signup_emojis(message: discord.Message) -> list[str]:
     if forwarded_from(message) or extract_entry(message, 1) is None:
         return []
     return find_emotes(message_text(message))
+
+
+def signup_line(mark: str, user_ids: Sequence[int], budget: int) -> str:
+    """'<emote> **N**: @a @b', cut short with '…and K more' if the mentions would pass budget characters."""
+    line = f"{mark} **{len(user_ids)}**" + (":" if user_ids else "")
+    shown = 0
+    for user_id in user_ids:
+        mention = f" <@{user_id}>"
+        if len(line) + len(mention) > budget - TAIL_RESERVE:
+            break
+        line += mention
+        shown += 1
+    if shown < len(user_ids):
+        line += f" …and {len(user_ids) - shown} more"
+    return line
+
+
+def format_signups(rows: Sequence[tuple[str, Sequence[int]]], limit: int = EMBED_LIMIT) -> str:
+    """One line per emote. Each gets an equal share of limit, so a huge list can't hide another emote's count."""
+    budget = limit // len(rows) - 1  # -1 for the newline between lines
+    return "\n".join(signup_line(mark, user_ids, budget) for mark, user_ids in rows)
 
 
 def pick_emoji(entry: Entry, emojis: Sequence[str]) -> str:

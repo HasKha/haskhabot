@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import discord
 
-from bot import find_emotes, signup_emojis
+from bot import find_emotes, format_signups, signup_emojis
 
 SHIELD = "\U0001f6e1️"
 HEART = "\U0001f49a"
@@ -73,6 +73,22 @@ def test_signup_emojis_none_without_a_timestamp():
 def test_signup_emojis_none_for_a_forward():
     forward = SimpleNamespace(type=discord.MessageReferenceType.forward, jump_url="https://discord.test/orig")
     assert signup_emojis(fake_message(f"{EVENT} {SHIELD}", reference=forward)) == []
+
+
+def test_format_signups_lists_count_and_mentions():
+    assert format_signups([(SHIELD, [1, 2, 3])]) == f"{SHIELD} **3**: <@1> <@2> <@3>"
+
+
+def test_format_signups_shows_an_empty_emote_with_zero():
+    assert format_signups([(SHIELD, [1]), (HEART, [])]) == f"{SHIELD} **1**: <@1>\n{HEART} **0**"
+
+
+def test_format_signups_truncates_without_hiding_other_emotes():
+    text = format_signups([(SHIELD, list(range(1000))), (HEART, [5])], limit=400)
+    first, second = text.split("\n")
+    assert len(text) <= 400
+    assert first.startswith(f"{SHIELD} **1000**:") and "more" in first.split(">")[-1]
+    assert second == f"{HEART} **1**: <@5>"
 
 
 if __name__ == "__main__":
