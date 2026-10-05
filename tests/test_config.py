@@ -115,7 +115,7 @@ class RecordingMapping:
     def __init__(self, name):
         self.name, self.calls = name, []
 
-    def on_message(self, message):
+    async def on_message(self, message):
         self.calls.append(("message", message.id))
 
     async def on_edit(self, payload):

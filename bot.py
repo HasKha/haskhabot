@@ -42,6 +42,7 @@ RETRY_SECONDS = 60
 MAX_WAIT_SECONDS = 3600  # re-render at least hourly, as a safety net
 SOURCE_PERMISSIONS = ("view_channel", "read_message_history")
 LIST_PERMISSIONS = ("view_channel", "read_message_history", "send_messages", "embed_links")
+REACTION_PERMISSIONS = ("add_reactions",)  # optional, in the source channel: only signup reactions need it
 
 
 @dataclass(frozen=True)
@@ -303,7 +304,7 @@ class Mapping:
         self.lock = asyncio.Lock()
         self.dirty = asyncio.Event()
         self.last_problems: list[str] = []
-        self.backfilling: asyncio.Task | None = None  # reactions being added to posts found by the last rescan
+        self.can_react = True  # last known state of the optional Add Reactions permission
 
     def check_channels(self) -> list[str]:
         """Return what's stopping this mapping from working, or an empty list if nothing is."""
@@ -322,6 +323,24 @@ class Mapping:
                 problems.append(f"missing permissions in #{channel.name} ({label}): {', '.join(missing)}")
         return problems
 
+    def check_reactions(self) -> bool:
+        """Whether the bot may add signup reactions in the source channel; warns when that changes.
+
+        Optional: without it the bot just doesn't react, and everything else keeps working.
+        """
+        source = self.client.get_channel(self.pair.source_id)
+        allowed = isinstance(source, discord.abc.GuildChannel) and all(
+            getattr(source.permissions_for(source.guild.me), name) for name in REACTION_PERMISSIONS
+        )
+        if allowed != self.can_react:
+            if allowed:
+                log.info("[%s] Add Reactions permission is back: signup reactions are on again", self.label)
+            else:
+                log.warning("[%s] Missing Add Reactions in the source channel: new posts won't get signup "
+                            "reactions until it's granted. Everything else keeps working.", self.label)
+        self.can_react = allowed
+        return allowed
+
     async def rescan_logged(self) -> None:
         """rescan(), logging failures so they can't affect the other mappings."""
         try:
@@ -337,6 +356,8 @@ class Mapping:
             elif self.check_channels():
                 log.error("[%s] Lost access to the channels", self.label)
                 await self.rescan()  # logs what's missing and waits for a fix
+            else:
+                self.check_reactions()  # warns if Add Reactions was removed or granted since last time
         except Exception:
             log.exception("[%s] Rescan failed", self.label)
 
@@ -354,32 +375,17 @@ class Mapping:
         source = self.client.get_channel(self.pair.source_id)
         target = self.client.get_channel(self.pair.list_id)
 
-        backfill: list[discord.Message] = []
+        self.check_reactions()
         async with self.lock:
             self.list_messages = [
                 m async for m in target.history(limit=100, oldest_first=True) if m.author == self.client.user
             ]
             self.entries.clear()
             async for message in source.history(limit=self.config.history_limit):
-                self.ingest(message)
-                entry = self.entries.get(message.id)
-                if entry and upcoming([entry], time.time(), self.config.keep_seconds):
-                    backfill.append(message)  # still listed: catches posts made while the bot was offline
+                self.ingest(message)  # existing posts are listed but never get reactions
             self.source, self.target = source, target
         log.info("Watching #%s, list in #%s: found %d timestamped posts", source.name, target.name, len(self.entries))
         self.dirty.set()
-        if self.backfilling is not None:
-            self.backfilling.cancel()  # this rescan supersedes the last one's
-        # A task: reacting is rate-limited and slow, and neither the list nor other mappings should wait for it.
-        self.backfilling = asyncio.create_task(self.backfill(backfill))
-
-    async def backfill(self, messages: list[discord.Message]) -> None:
-        """React to posts that predate the bot or were made while it was offline."""
-        try:
-            for message in messages:
-                await self.add_reactions(message)
-        except Exception:
-            log.exception("[%s] Adding reactions to existing posts failed", self.label)
 
     def ingest(self, message: discord.Message) -> bool:
         """Record or drop a source message. Returns True if the list changed."""
@@ -391,11 +397,14 @@ class Mapping:
         return changed
 
     async def add_reactions(self, message: discord.Message) -> None:
-        """React with the post's signup emotes the bot hasn't added yet. A failed one is logged and skipped."""
-        have = {str(r.emoji) for r in message.reactions if r.me}
-        for mark in signup_emojis(message):
-            if mark in have:
-                continue
+        """React with a newly sent post's signup emotes. A failed one is logged and skipped.
+
+        Only called once per post, when it's sent: never on edits, rescans or startup.
+        """
+        emotes = signup_emojis(message)
+        if not emotes or not self.check_reactions():
+            return
+        for mark in emotes:
             try:
                 await message.add_reaction(mark)
             except discord.HTTPException as e:
@@ -416,8 +425,7 @@ class Mapping:
         except discord.NotFound:
             return
         if self.ingest(message):
-            self.dirty.set()
-        await self.add_reactions(message)  # picks up emotes added by the edit
+            self.dirty.set()  # edits update the list, but never add reactions
 
     def forget(self, message_ids: set[int], channel_id: int) -> None:
         if channel_id == self.pair.source_id:
