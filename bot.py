@@ -44,6 +44,13 @@ class MappingConfig:
     list_id: int
 
 
+def env_channel_id(env: collections.abc.Mapping[str, str], name: str) -> int:
+    try:
+        return int(env[name])
+    except ValueError:
+        raise ValueError(f"{name} must be a channel ID (digits only), got {env[name]!r}") from None
+
+
 def read_mappings(path: Path, env: collections.abc.Mapping[str, str]) -> tuple[MappingConfig, ...]:
     """Mappings from the JSON file, else from the legacy SOURCE_CHANNEL_ID/LIST_CHANNEL_ID pair.
 
@@ -54,6 +61,9 @@ def read_mappings(path: Path, env: collections.abc.Mapping[str, str]) -> tuple[M
             raw = json.loads(path.read_text(encoding="utf-8-sig"))  # -sig: Notepad adds a BOM
         except json.JSONDecodeError as e:
             raise ValueError(f"{path} is not valid JSON: {e}") from e
+        except (OSError, UnicodeDecodeError) as e:
+            # e.g. a directory: Docker creates one when bind-mounting a host file that doesn't exist.
+            raise ValueError(f"Can't read {path}: {e}") from e
         if not isinstance(raw, list) or not raw:
             raise ValueError(f'{path} must be a non-empty list of {{"source": ..., "list": ...}} objects')
         mappings = []
@@ -63,7 +73,7 @@ def read_mappings(path: Path, env: collections.abc.Mapping[str, str]) -> tuple[M
                 raise ValueError(f'{path} entry {i} needs integer "source" and "list" channel IDs (no quotes)')
             mappings.append(MappingConfig(item["source"], item["list"]))
     elif env.get("SOURCE_CHANNEL_ID") and env.get("LIST_CHANNEL_ID"):
-        mappings = [MappingConfig(int(env["SOURCE_CHANNEL_ID"]), int(env["LIST_CHANNEL_ID"]))]
+        mappings = [MappingConfig(env_channel_id(env, "SOURCE_CHANNEL_ID"), env_channel_id(env, "LIST_CHANNEL_ID"))]
     else:
         raise ValueError(f"No mappings: create {path} or set SOURCE_CHANNEL_ID and LIST_CHANNEL_ID")
 
@@ -256,6 +266,24 @@ class Mapping:
                 problems.append(f"missing permissions in #{channel.name} ({label}): {', '.join(missing)}")
         return problems
 
+    async def rescan_logged(self) -> None:
+        """rescan(), logging failures so they can't affect the other mappings."""
+        try:
+            await self.rescan()
+        except Exception:
+            log.exception("[%s] Rescan failed", self.label)
+
+    async def recheck_access(self) -> None:
+        """Called periodically: rescan when waiting for access, or when access was just lost."""
+        try:
+            if self.target is None:
+                await self.rescan()  # waiting for access: full rescan once it's back
+            elif self.check_channels():
+                log.error("[%s] Lost access to the channels", self.label)
+                await self.rescan()  # logs what's missing and waits for a fix
+        except Exception:
+            log.exception("[%s] Rescan failed", self.label)
+
     async def rescan(self) -> None:
         problems = self.check_channels()
         if problems:
@@ -390,11 +418,8 @@ class HaskhaBot(discord.Client):
     async def on_ready(self) -> None:
         # Fires again after a full reconnect, so rescanning here also catches anything missed offline.
         log.info("Logged in as %s", self.user)
-        for mapping in self.mappings:
-            try:
-                await mapping.rescan()
-            except Exception:
-                log.exception("[%s] Rescan failed", mapping.label)
+        # Concurrently, so a big channel's history scan doesn't delay the other lists.
+        await asyncio.gather(*(m.rescan_logged() for m in self.mappings))
 
     async def watch_access(self) -> None:
         # Stay connected and retry rather than exiting: a restart loop would burn through Discord's
@@ -404,15 +429,7 @@ class HaskhaBot(discord.Client):
         await self.wait_until_ready()
         while not self.is_closed():
             await asyncio.sleep(RETRY_SECONDS)
-            for mapping in self.mappings:
-                try:
-                    if mapping.target is None:
-                        await mapping.rescan()  # waiting for access: full rescan once it's back
-                    elif mapping.check_channels():
-                        log.error("[%s] Lost access to the channels", mapping.label)
-                        await mapping.rescan()  # logs what's missing and waits for a fix
-                except Exception:
-                    log.exception("[%s] Rescan failed", mapping.label)
+            await asyncio.gather(*(m.recheck_access() for m in self.mappings))
 
     async def on_message(self, message: discord.Message) -> None:
         mapping = self.by_channel.get(message.channel.id)

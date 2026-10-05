@@ -1,16 +1,14 @@
 """Tests for the pure parsing/rendering logic. Run with: pytest"""
 
-import sys
+import asyncio
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace as NS
 
 import discord
 from discord.components import _component_factory
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import bot  # noqa: E402
+import bot
 
 POSTED = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
 HOUR = 3600
@@ -39,9 +37,13 @@ def snapshot(content="", embeds=(), components=()):
 
 
 def config(**overrides):
-    values = dict(token="x", source_channel_id=1, list_channel_id=2, preview_lines=3,
+    values = dict(token="x", mappings=(bot.MappingConfig(1, 2),), preview_lines=3,
                   history_limit=None, keep_seconds=4 * HOUR)
     return bot.Config(**{**values, **overrides})
+
+
+def mapping(client=None, source=1, list_=2):
+    return bot.Mapping(client, bot.MappingConfig(source, list_), config())
 
 
 class FakeEmoji:
@@ -103,11 +105,11 @@ def test_empty_list_text():
 
 
 def test_empty_text_uses_server_emoji_when_present():
-    client = bot.HaskhaBot(config())
-    client.target = NS(guild=NS(emojis=[FakeEmoji("frog", 1), FakeEmoji(bot.EMPTY_EMOJI, 9)]))
-    assert client.empty_text() == f"No events scheduled <:{bot.EMPTY_EMOJI}:9>"
-    client.target = NS(guild=NS(emojis=[FakeEmoji("frog", 1)]))
-    assert client.empty_text() == "No events scheduled"
+    m = mapping()
+    m.target = NS(guild=NS(emojis=[FakeEmoji("frog", 1), FakeEmoji(bot.EMPTY_EMOJI, 9)]))
+    assert m.empty_text() == f"No events scheduled <:{bot.EMPTY_EMOJI}:9>"
+    m.target = NS(guild=NS(emojis=[FakeEmoji("frog", 1)]))
+    assert m.empty_text() == "No events scheduled"
 
 
 # --- emojis ---
@@ -138,11 +140,11 @@ def test_events_stay_listed_until_keep_window_passes():
 
 def test_wakes_up_when_next_event_expires():
     now = time.time()
-    client = bot.HaskhaBot(config())
-    client.entries = {1: bot.extract_entry(msg("x <t:%d>" % (now - 4 * HOUR + 60), 1), 3)}
-    assert 55 < client.seconds_until_next_expiry() <= 62
-    client.entries = {}
-    assert client.seconds_until_next_expiry() == bot.MAX_WAIT_SECONDS
+    m = mapping()
+    m.entries = {1: bot.extract_entry(msg("x <t:%d>" % (now - 4 * HOUR + 60), 1), 3)}
+    assert 55 < m.seconds_until_next_expiry() <= 62
+    m.entries = {}
+    assert m.seconds_until_next_expiry() == bot.MAX_WAIT_SECONDS
 
 
 # --- "on fill" ---
@@ -236,36 +238,65 @@ class FakeChannel(discord.abc.GuildChannel, discord.abc.Messageable):
 
 def test_check_channels_reports_missing_permissions():
     full = dict(view_channel=True, read_message_history=True, send_messages=True, embed_links=True)
-    client = bot.HaskhaBot(config())
     channels = {1: FakeChannel("scheduling", **full), 2: FakeChannel("upcoming", **full)}
-    client.get_channel = channels.get
-    assert client.check_channels() == []
+    m = mapping(NS(get_channel=channels.get))
+    assert m.check_channels() == []
     channels[1] = FakeChannel("scheduling")  # e.g. re-synced with a category that lacks the bot
-    assert client.check_channels() == ["missing permissions in #scheduling (source): view_channel, read_message_history"]
+    assert m.check_channels() == ["missing permissions in #scheduling (source): view_channel, read_message_history"]
     del channels[2]
-    assert "list channel 2 not found" in client.check_channels()[1]
+    assert "list channel 2 not found" in m.check_channels()[1]
 
 
-def test_watcher_rescans_on_lost_and_regained_access(monkeypatch):
-    import asyncio
-
-    monkeypatch.setattr(bot, "RETRY_SECONDS", 0)
-    client = bot.HaskhaBot(config())
-    client.target = object()  # currently working
+def test_recheck_rescans_on_lost_and_regained_access():
+    m = mapping()
+    m.target = object()  # currently working
     problems = [["no access"], ["no access"], []]  # lost, still lost, regained
     rescans = []
+
+    async def rescan():
+        rescans.append(problems[0])
+        m.target = None if problems.pop(0) else object()
+
+    m.check_channels = lambda: problems[0]
+    m.rescan = rescan
+    for _ in range(3):
+        asyncio.run(m.recheck_access())
+    assert rescans == [["no access"], ["no access"], []]
+    assert m.target is not None
+
+
+def test_recheck_leaves_a_working_mapping_alone():
+    m = mapping()
+    m.target = object()
+    m.check_channels = lambda: []
+
+    async def rescan():
+        raise AssertionError("should not rescan")
+
+    m.rescan = rescan
+    asyncio.run(m.recheck_access())
+
+
+def test_watcher_isolates_a_failing_mapping(monkeypatch):
+    monkeypatch.setattr(bot, "RETRY_SECONDS", 0)
+    client = bot.HaskhaBot(config())
+    broken, healthy = mapping(source=1, list_=2), mapping(source=3, list_=4)
+    rounds = []
+
+    async def explode():
+        raise RuntimeError("boom")
+
+    async def record():
+        rounds.append("healthy rescanned")
+
+    broken.target = healthy.target = None  # both waiting for access
+    broken.rescan, healthy.rescan = explode, record
+    client.mappings = [broken, healthy]
 
     async def wait_until_ready():
         pass
 
-    async def rescan():
-        rescans.append(problems[0])
-        client.target = None if problems.pop(0) else object()
-
     client.wait_until_ready = wait_until_ready
-    client.check_channels = lambda: problems[0]
-    client.rescan = rescan
-    client.is_closed = lambda: not problems
+    client.is_closed = lambda: len(rounds) >= 2
     asyncio.run(client.watch_access())
-    assert rescans == [["no access"], ["no access"], []]
-    assert client.target is not None
+    assert rounds == ["healthy rescanned", "healthy rescanned"]  # kept going despite the broken one
