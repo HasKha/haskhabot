@@ -86,14 +86,23 @@ def read_mappings(path: Path, env: collections.abc.Mapping[str, str]) -> tuple[M
     else:
         raise ValueError(f"No mappings: create {path} or set SOURCE_CHANNEL_ID and LIST_CHANNEL_ID")
 
-    ids = [i for m in mappings for i in (m.source_id, m.list_id)]
-    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    # A source may feed several lists and a list may collect several sources, but a channel can't be
+    # both: the bot would read its own list embeds as event posts.
+    both = sorted({m.source_id for m in mappings} & {m.list_id for m in mappings})
+    if both:
+        raise ValueError("A channel can't be both a source and a list; used as both: " + ", ".join(map(str, both)))
+    repeated = sorted({f"{m.source_id} → {m.list_id}" for m in mappings if mappings.count(m) > 1})
     if repeated:
-        raise ValueError(
-            "Every channel ID must be unique across all sources and lists; repeated: "
-            + ", ".join(map(str, repeated))
-        )
+        raise ValueError("Pair listed more than once: " + ", ".join(repeated))
     return tuple(mappings)
+
+
+def group_by_list(pairs: Iterable[MappingConfig]) -> dict[int, tuple[int, ...]]:
+    """List channel -> the source channels it collects, in the order they appear in the config."""
+    lists: dict[int, list[int]] = {}
+    for pair in pairs:
+        lists.setdefault(pair.list_id, []).append(pair.source_id)
+    return {list_id: tuple(sources) for list_id, sources in lists.items()}
 
 
 @dataclass(frozen=True)
@@ -297,33 +306,95 @@ def render_pages(entries: Iterable[Entry], emojis: Sequence[str] = (), empty_tex
     return pages
 
 
-class Mapping:
-    """One source → list pair: its entries, the list messages we keep, and the sync logic."""
+class SourceReactions:
+    """Signup reactions for one source channel. Shared by every list the channel feeds, so each post is
+    reacted to once however many lists it appears in."""
 
-    def __init__(self, client: discord.Client, pair: MappingConfig, config: Config):
+    def __init__(self, client: discord.Client, source_id: int):
         self.client = client
-        self.pair = pair
+        self.source_id = source_id
+        self.label = str(source_id)
+        self.can_react = True  # last known state of the optional Add Reactions permission
+        # Emotes already handled (reacted, failed or predating the bot) per post, so an edit only reacts
+        # with emotes it added. In memory only, bounded to the most recent posts.
+        self.seen_emotes: collections.OrderedDict[int, set[str]] = collections.OrderedDict()
+
+    def check(self) -> bool:
+        """Whether the bot may add reactions in this channel; warns when that changes.
+
+        Optional: without it the bot just doesn't react, and everything else keeps working.
+        """
+        channel = self.client.get_channel(self.source_id)
+        allowed = isinstance(channel, discord.abc.GuildChannel) and all(
+            getattr(channel.permissions_for(channel.guild.me), name) for name in REACTION_PERMISSIONS
+        )
+        if allowed != self.can_react:
+            where = f"#{channel.name}" if isinstance(channel, discord.abc.GuildChannel) else self.label
+            if allowed:
+                log.info("[%s] Add Reactions permission is back: signup reactions are on again", where)
+            else:
+                log.warning("[%s] Missing Add Reactions: new posts won't get signup reactions until it's "
+                            "granted. Everything else keeps working.", where)
+        self.can_react = allowed
+        return allowed
+
+    def remember(self, message_id: int, keys: set[str]) -> None:
+        self.seen_emotes[message_id] = keys
+        self.seen_emotes.move_to_end(message_id)
+        while len(self.seen_emotes) > REACTION_MEMORY:
+            self.seen_emotes.popitem(last=False)  # forget the least recently sent/edited post
+
+    def forget(self, message_ids: Iterable[int]) -> None:
+        for i in message_ids:
+            self.seen_emotes.pop(i, None)
+
+    async def add_reactions(self, message: discord.Message, *, edited: bool = False) -> None:
+        """React with the post's signup emotes that haven't been handled yet. A failed one is logged and skipped.
+
+        When a post is sent, all its emotes are new. On an edit, only emotes the edit added are: each emote is
+        tried once per post, so a bot that keeps editing its post, or an emote that can't be used, costs nothing.
+        Existing posts never get reactions: rescans don't call this, and the first edit the bot sees of a post
+        it didn't see sent (it predates startup) only records that post's emotes.
+        """
+        emotes = signup_emojis(message)
+        known = self.seen_emotes.get(message.id)
+        if edited and known is None:
+            self.remember(message.id, {emote_key(e) for e in emotes})
+            return
+        known = known or set()
+        new = [e for e in emotes if emote_key(e) not in known]
+        self.remember(message.id, known | {emote_key(e) for e in new})
+        if not new or not self.check():
+            return
+        for mark in new:
+            try:
+                await message.add_reaction(mark)
+            except discord.HTTPException as e:
+                log.warning("[%s] Couldn't react with %s on %s: %s", self.label, mark, message.jump_url, e)
+
+
+class Mapping:
+    """One list channel and the source channels it collects: entries, the list messages we keep, and sync."""
+
+    def __init__(self, client: discord.Client, list_id: int, source_ids: Sequence[int], config: Config):
+        self.client = client
+        self.list_id = list_id
+        self.source_ids = tuple(source_ids)
         self.config = config
-        self.label = f"{pair.source_id}→{pair.list_id}"
-        self.entries: dict[int, Entry] = {}  # source message id -> entry
+        self.label = f"{'+'.join(map(str, self.source_ids))}→{list_id}"
+        self.entries: dict[int, Entry] = {}  # source message id -> entry, across all sources
         self.list_messages: list[discord.Message] = []  # our messages in the list channel, in order
-        self.source: discord.abc.Messageable | None = None
-        self.target: discord.abc.Messageable | None = None
+        self.target: discord.abc.Messageable | None = None  # set once every channel is reachable
         self.lock = asyncio.Lock()
         self.dirty = asyncio.Event()
         self.last_problems: list[str] = []
-        self.can_react = True  # last known state of the optional Add Reactions permission
-        # Emotes already handled (reacted, failed or predating the bot) per source post, so an edit only
-        # reacts with emotes it added. In memory only, bounded to the most recent posts.
-        self.seen_emotes: collections.OrderedDict[int, set[str]] = collections.OrderedDict()
 
     def check_channels(self) -> list[str]:
-        """Return what's stopping this mapping from working, or an empty list if nothing is."""
+        """Return what's stopping this list from working, or an empty list if nothing is."""
         problems = []
-        for label, channel_id, needed in (
-            ("source", self.pair.source_id, SOURCE_PERMISSIONS),
-            ("list", self.pair.list_id, LIST_PERMISSIONS),
-        ):
+        checks = [("source", i, SOURCE_PERMISSIONS) for i in self.source_ids]
+        checks.append(("list", self.list_id, LIST_PERMISSIONS))
+        for label, channel_id, needed in checks:
             channel = self.client.get_channel(channel_id)
             if not isinstance(channel, discord.abc.GuildChannel) or not isinstance(channel, discord.abc.Messageable):
                 problems.append(f"{label} channel {channel_id} not found (wrong ID, or the bot isn't in that server)")
@@ -334,26 +405,8 @@ class Mapping:
                 problems.append(f"missing permissions in #{channel.name} ({label}): {', '.join(missing)}")
         return problems
 
-    def check_reactions(self) -> bool:
-        """Whether the bot may add signup reactions in the source channel; warns when that changes.
-
-        Optional: without it the bot just doesn't react, and everything else keeps working.
-        """
-        source = self.client.get_channel(self.pair.source_id)
-        allowed = isinstance(source, discord.abc.GuildChannel) and all(
-            getattr(source.permissions_for(source.guild.me), name) for name in REACTION_PERMISSIONS
-        )
-        if allowed != self.can_react:
-            if allowed:
-                log.info("[%s] Add Reactions permission is back: signup reactions are on again", self.label)
-            else:
-                log.warning("[%s] Missing Add Reactions in the source channel: new posts won't get signup "
-                            "reactions until it's granted. Everything else keeps working.", self.label)
-        self.can_react = allowed
-        return allowed
-
     async def rescan_logged(self) -> None:
-        """rescan(), logging failures so they can't affect the other mappings."""
+        """rescan(), logging failures so they can't affect the other lists."""
         try:
             await self.rescan()
         except Exception:
@@ -367,8 +420,6 @@ class Mapping:
             elif self.check_channels():
                 log.error("[%s] Lost access to the channels", self.label)
                 await self.rescan()  # logs what's missing and waits for a fix
-            else:
-                self.check_reactions()  # warns if Add Reactions was removed or granted since last time
         except Exception:
             log.exception("[%s] Rescan failed", self.label)
 
@@ -380,22 +431,23 @@ class Mapping:
                     log.error("[%s] %s", self.label, problem)
                 log.error("[%s] Retrying every %d seconds", self.label, RETRY_SECONDS)
             self.last_problems = problems
-            self.source = self.target = None
+            self.target = None
             return
         self.last_problems = []
-        source = self.client.get_channel(self.pair.source_id)
-        target = self.client.get_channel(self.pair.list_id)
+        sources = [self.client.get_channel(i) for i in self.source_ids]
+        target = self.client.get_channel(self.list_id)
 
-        self.check_reactions()
         async with self.lock:
             self.list_messages = [
                 m async for m in target.history(limit=100, oldest_first=True) if m.author == self.client.user
             ]
             self.entries.clear()
-            async for message in source.history(limit=self.config.history_limit):
-                self.ingest(message)  # existing posts are listed but never get reactions
-            self.source, self.target = source, target
-        log.info("Watching #%s, list in #%s: found %d timestamped posts", source.name, target.name, len(self.entries))
+            for source in sources:
+                async for message in source.history(limit=self.config.history_limit):
+                    self.ingest(message)  # existing posts are listed but never get reactions
+            self.target = target
+        log.info("Watching %s, list in #%s: found %d timestamped posts",
+                 ", ".join(f"#{s.name}" for s in sources), target.name, len(self.entries))
         self.dirty.set()
 
     def ingest(self, message: discord.Message) -> bool:
@@ -407,60 +459,15 @@ class Mapping:
         self.entries[message.id] = entry
         return changed
 
-    def remember_emotes(self, message_id: int, keys: set[str]) -> None:
-        self.seen_emotes[message_id] = keys
-        self.seen_emotes.move_to_end(message_id)
-        while len(self.seen_emotes) > REACTION_MEMORY:
-            self.seen_emotes.popitem(last=False)  # forget the least recently sent/edited post
-
-    async def add_reactions(self, message: discord.Message, *, edited: bool = False) -> None:
-        """React with the post's signup emotes that haven't been handled yet. A failed one is logged and skipped.
-
-        When a post is sent, all its emotes are new. On an edit, only emotes the edit added are: each emote is
-        tried once per post, so a bot that keeps editing its post, or an emote that can't be used, costs nothing.
-        Existing posts never get reactions: rescans don't call this, and the first edit the bot sees of a post
-        it didn't see sent (it predates startup) only records that post's emotes.
-        """
-        emotes = signup_emojis(message)
-        known = self.seen_emotes.get(message.id)
-        if edited and known is None:
-            self.remember_emotes(message.id, {emote_key(e) for e in emotes})
-            return
-        known = known or set()
-        new = [e for e in emotes if emote_key(e) not in known]
-        self.remember_emotes(message.id, known | {emote_key(e) for e in new})
-        if not new or not self.check_reactions():
-            return
-        for mark in new:
-            try:
-                await message.add_reaction(mark)
-            except discord.HTTPException as e:
-                log.warning("[%s] Couldn't react with %s on %s: %s", self.label, mark, message.jump_url, e)
-
-    async def on_message(self, message: discord.Message) -> None:
-        if message.channel.id != self.pair.source_id:
-            return
-        if self.ingest(message):
+    def on_message(self, message: discord.Message) -> None:
+        """A message was sent, or (on edit) its new version: update the list if it's from one of our sources."""
+        if message.channel.id in self.source_ids and self.ingest(message):
             self.dirty.set()
-        await self.add_reactions(message)
-
-    async def on_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
-        if payload.channel_id != self.pair.source_id or self.source is None:
-            return
-        try:
-            message = await self.source.fetch_message(payload.message_id)
-        except discord.NotFound:
-            return
-        if self.ingest(message):
-            self.dirty.set()
-        await self.add_reactions(message, edited=True)  # only emotes the edit added
 
     def forget(self, message_ids: set[int], channel_id: int) -> None:
-        if channel_id == self.pair.source_id:
-            for i in message_ids:
-                self.seen_emotes.pop(i, None)
+        if channel_id in self.source_ids:
             removed = [self.entries.pop(i) for i in message_ids if i in self.entries]
-        elif channel_id == self.pair.list_id:
+        elif channel_id == self.list_id:
             # Someone deleted one of our list messages; the next sync recreates it.
             removed = [m for m in self.list_messages if m.id in message_ids]
             self.list_messages = [m for m in self.list_messages if m.id not in message_ids]
@@ -471,7 +478,7 @@ class Mapping:
 
     def event_in_thread(self, thread) -> Entry | None:
         """The event post this thread was started from, if it's one of ours (and not a forward)."""
-        if getattr(thread, "parent_id", None) != self.pair.source_id:
+        if getattr(thread, "parent_id", None) not in self.source_ids:
             return None
         entry = self.entries.get(thread.id)  # a thread started from a message shares its id
         return None if entry is None or entry.forwarded else entry
@@ -538,13 +545,23 @@ class HaskhaBot(discord.Client):
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.config = config
         self.mappings: list[Mapping] = []
-        self.by_channel: dict[int, Mapping] = {}  # source and list channel ids -> their mapping
+        self.by_channel: dict[int, list[Mapping]] = {}  # source and list channel ids -> the lists using them
+        self.reactions: dict[int, SourceReactions] = {}  # source channel id -> its signup reactions
         self.tree = app_commands.CommandTree(self)
+
+    def build(self) -> None:
+        """One Mapping per list channel, routing by channel id, and one SourceReactions per source channel."""
+        lists = group_by_list(self.config.mappings)
+        self.mappings = [Mapping(self, list_id, sources, self.config) for list_id, sources in lists.items()]
+        self.by_channel = {}
+        for m in self.mappings:
+            for channel_id in (*m.source_ids, m.list_id):
+                self.by_channel.setdefault(channel_id, []).append(m)
+        self.reactions = {pair.source_id: SourceReactions(self, pair.source_id) for pair in self.config.mappings}
 
     async def setup_hook(self) -> None:
         # Built here, not in __init__: asyncio.Lock/Event need the running loop on older Pythons.
-        self.mappings = [Mapping(self, pair, self.config) for pair in self.config.mappings]
-        self.by_channel = {i: m for m in self.mappings for i in (m.pair.source_id, m.pair.list_id)}
+        self.build()
         self.updaters = [asyncio.create_task(m.run_updater()) for m in self.mappings]
         self.watcher = asyncio.create_task(self.watch_access())
 
@@ -561,6 +578,8 @@ class HaskhaBot(discord.Client):
     async def on_ready(self) -> None:
         # Fires again after a full reconnect, so rescanning here also catches anything missed offline.
         log.info("Logged in as %s", self.user)
+        for reactions in self.reactions.values():
+            reactions.check()  # warns now if Add Reactions is missing anywhere
         # Concurrently, so a big channel's history scan doesn't delay the other lists.
         await asyncio.gather(*(m.rescan_logged() for m in self.mappings))
 
@@ -568,24 +587,28 @@ class HaskhaBot(discord.Client):
         # Stay connected and retry rather than exiting: a restart loop would burn through Discord's
         # login limit. Polling also picks up permission changes, which the bot gets no event for:
         # losing access (e.g. a channel re-synced with its category) stops message events silently.
-        # Each mapping is handled on its own, so one with a problem doesn't hold up the others.
+        # Each list is handled on its own, so one with a problem doesn't hold up the others.
         await self.wait_until_ready()
         while not self.is_closed():
             await asyncio.sleep(RETRY_SECONDS)
+            for reactions in self.reactions.values():
+                reactions.check()  # warns if Add Reactions was removed or granted since last time
             await asyncio.gather(*(m.recheck_access() for m in self.mappings))
 
     async def list_signups(self, interaction: discord.Interaction) -> None:
         thread = interaction.channel
-        mapping = self.by_channel.get(getattr(thread, "parent_id", None))
-        if mapping is None or mapping.source is None or mapping.event_in_thread(thread) is None:
+        parent_id = getattr(thread, "parent_id", None)
+        found = [m for m in self.by_channel.get(parent_id, []) if m.event_in_thread(thread) is not None]
+        source = self.get_channel(parent_id) if found else None
+        if source is None:
             await interaction.response.send_message(NOT_AN_EVENT_THREAD, ephemeral=True)
             return
         await interaction.response.defer()  # reading reactions can take longer than Discord's 3 seconds
         try:
-            message = await mapping.source.fetch_message(thread.id)
+            message = await source.fetch_message(thread.id)
             rows = await signup_rows(message, self.user.id)
         except discord.HTTPException:
-            log.exception("[%s] Couldn't read signups for %s", mapping.label, thread.id)
+            log.exception("[%s] Couldn't read signups for %s", parent_id, thread.id)
             await interaction.followup.send("Couldn't read that post's reactions.", ephemeral=True)
             return
         if not rows:
@@ -595,24 +618,38 @@ class HaskhaBot(discord.Client):
         await interaction.followup.send(embed=embed)
 
     async def on_message(self, message: discord.Message) -> None:
-        mapping = self.by_channel.get(message.channel.id)
-        if mapping:
-            await mapping.on_message(message)
+        channel_id = message.channel.id
+        for mapping in self.by_channel.get(channel_id, []):
+            mapping.on_message(message)
+        if channel_id in self.reactions:
+            await self.reactions[channel_id].add_reactions(message)
 
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
-        mapping = self.by_channel.get(payload.channel_id)
-        if mapping:
-            await mapping.on_edit(payload)
+        channel_id = payload.channel_id
+        if channel_id not in self.reactions:  # only source channels matter: list channels hold our own posts
+            return
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)  # once, for every list using this source
+        except (discord.NotFound, discord.Forbidden):
+            return
+        for mapping in self.by_channel.get(channel_id, []):
+            mapping.on_message(message)
+        await self.reactions[channel_id].add_reactions(message, edited=True)  # only emotes the edit added
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
-        mapping = self.by_channel.get(payload.channel_id)
-        if mapping:
-            mapping.forget({payload.message_id}, payload.channel_id)
+        self.forget({payload.message_id}, payload.channel_id)
 
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
-        mapping = self.by_channel.get(payload.channel_id)
-        if mapping:
-            mapping.forget(payload.message_ids, payload.channel_id)
+        self.forget(set(payload.message_ids), payload.channel_id)
+
+    def forget(self, message_ids: set[int], channel_id: int) -> None:
+        for mapping in self.by_channel.get(channel_id, []):
+            mapping.forget(message_ids, channel_id)
+        if channel_id in self.reactions:
+            self.reactions[channel_id].forget(message_ids)
 
     async def on_guild_emojis_update(self, guild: discord.Guild, before, after) -> None:
         for mapping in self.mappings:

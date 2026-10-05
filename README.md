@@ -2,7 +2,7 @@
 
 Watches a channel for posts containing Discord timestamps (`<t:1760000000:F>`) and keeps a
 sorted list of them in another channel: time · author · first lines · link. Events drop off the
-list 4 hours after they start (configurable). Set up as many source → list channel pairs as you like.
+list 4 hours after they start (configurable). Set up as many source → list channel pairs as you like, sharing sources and lists between them.
 
 The bot keeps no database. On startup it rescans each source channel, then follows new, edited and
 deleted posts, editing its own list messages in place.
@@ -50,14 +50,19 @@ Copy `.env.example` to `.env` and fill in the token. With Docker, pass the same 
 ```json
 [
   {"source": 111111111111111111, "list": 222222222222222222},
+  {"source": 111111111111111111, "list": 444444444444444444},
   {"source": 333333333333333333, "list": 444444444444444444}
 ]
 ```
 
-Each pair watches one source channel and keeps its list in one list channel. IDs are plain numbers
-(no quotes), and every channel may appear only once in the file, as either a source or a list.
-If one pair can't be reached (wrong ID, missing permissions), the bot logs it and keeps retrying
-while the other pairs carry on. After editing `mappings.json`, restart the bot.
+Each pair sends one source channel's events to one list channel. A source can feed several lists and
+a list can collect several sources: above, the first source's events appear in both lists, and the
+second list combines both sources into one list. A channel can't be both a source and a list. IDs are
+plain numbers (no quotes).
+
+Each list channel works on its own: if one can't be reached (wrong ID, missing permissions in it or
+in one of its sources), the bot logs it and keeps retrying while the other lists carry on. After
+editing `mappings.json`, restart the bot.
 
 The settings below apply to every pair.
 

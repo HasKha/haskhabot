@@ -44,7 +44,7 @@ def config(**overrides):
 
 
 def mapping(client=None, source=1, list_=2):
-    return bot.Mapping(client, bot.MappingConfig(source, list_), config())
+    return bot.Mapping(client, list_, (source,), config())
 
 
 class FakeEmoji:

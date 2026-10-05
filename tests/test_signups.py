@@ -41,10 +41,37 @@ def fake_message(content, *, reference=None, reactions=(), fail=(), channel_id=1
     )
 
 
-def mapping(add_reactions=True, config=CONFIG):
-    """A Mapping for source channel 1 / list channel 2, with or without Add Reactions in the source."""
-    channels = {1: FakeChannel("src", **VISIBLE, add_reactions=add_reactions)}
-    return Mapping(NS(get_channel=channels.get, user=None), MappingConfig(1, 2), config)
+def client_for(*pairs, add_reactions=True):
+    """A built HaskhaBot for (source, list) pairs whose source channels do or don't grant Add Reactions.
+
+    Returns the client and its channels dict, which tests can change to simulate permission changes.
+    """
+    channels = {s: FakeChannel(f"src{s}", **VISIBLE, add_reactions=add_reactions) for s, _ in pairs}
+    config = Config(token="x", mappings=tuple(MappingConfig(s, l) for s, l in pairs), preview_lines=3,
+                    history_limit=None, keep_seconds=0)
+    client = HaskhaBot(config)
+    client.get_channel = channels.get
+    client.build()
+    return client, channels
+
+
+def lists(client):
+    """list channel id -> its Mapping"""
+    return {m.list_id: m for m in client.mappings}
+
+
+def send(client, message):
+    asyncio.run(client.on_message(message))
+
+
+def edit(client, message):
+    """Deliver an edit: the client fetches `message` (the new version) from its channel."""
+
+    async def fetch_message(message_id):
+        return message
+
+    client.get_channel(message.channel.id).fetch_message = fetch_message
+    asyncio.run(client.on_raw_message_edit(NS(channel_id=message.channel.id, message_id=message.id)))
 
 
 def reaction(mark, user_ids, me=True):
@@ -98,120 +125,100 @@ def test_signup_emojis_none_for_a_forward():
     assert signup_emojis(fake_message(f"{EVENT} {SHIELD}", reference=FORWARD)) == []
 
 
-# --- reacting: only to newly sent posts ---
+# --- reacting: when a post is sent, and to emotes an edit adds ---
 
 def test_new_post_gets_its_emotes_in_order():
+    client, _ = client_for((1, 2))
     message = fake_message(f"{EVENT} {SHIELD} {CUSTOM} {HEART}")
-    asyncio.run(mapping().on_message(message))
+    send(client, message)
     assert message.calls == [SHIELD, CUSTOM, HEART]
 
 
 def test_a_failed_reaction_is_skipped():
+    client, _ = client_for((1, 2))
     message = fake_message(f"{EVENT} {SHIELD} {CUSTOM} {HEART}", fail=(CUSTOM,))
-    asyncio.run(mapping().on_message(message))
+    send(client, message)
     assert message.calls == [SHIELD, HEART]
 
 
-def test_only_posts_in_the_source_channel_get_reactions():
-    m = mapping()
-    inside, outside = fake_message(f"{EVENT} {SHIELD}", channel_id=1), fake_message(f"{EVENT} {SHIELD}", channel_id=3)
-    asyncio.run(m.on_message(inside))
-    asyncio.run(m.on_message(outside))
-    assert inside.calls == [SHIELD] and outside.calls == []
+def test_only_posts_in_a_source_channel_get_reactions():
+    client, _ = client_for((1, 2))
+    in_list, unmapped = fake_message(f"{EVENT} {SHIELD}", channel_id=2), fake_message(f"{EVENT} {SHIELD}", channel_id=3)
+    send(client, in_list)
+    send(client, unmapped)
+    assert in_list.calls == unmapped.calls == []
 
 
 def test_forwarded_post_gets_no_reactions_but_is_listed():
-    m = mapping()
+    client, _ = client_for((1, 2))
     message = fake_message(f"{EVENT} {SHIELD}", reference=FORWARD)
-    asyncio.run(m.on_message(message))
-    assert message.calls == [] and message.id in m.entries
-
-
-def send_then_edit(m, sent, *edits):
-    """Send `sent` to the mapping, then deliver each edited version of it (same message id)."""
-    versions = list(edits)
-
-    async def fetch_message(message_id):
-        return versions.pop(0)
-
-    m.source = NS(fetch_message=fetch_message)
-
-    async def run():
-        if sent is not None:
-            await m.on_message(sent)
-        for edited in edits:
-            await m.on_edit(NS(channel_id=1, message_id=edited.id))
-
-    asyncio.run(run())
+    send(client, message)
+    assert message.calls == [] and message.id in lists(client)[2].entries
 
 
 def test_edit_reacts_only_with_emotes_it_added():
-    m = mapping()
-    sent = fake_message(f"{EVENT} {SHIELD}", mid=5)
-    edited = fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5)
-    send_then_edit(m, sent, edited)
+    client, _ = client_for((1, 2))
+    send(client, sent := fake_message(f"{EVENT} {SHIELD}", mid=5))
+    edit(client, edited := fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5))
     assert sent.calls == [SHIELD] and edited.calls == [HEART]
-    assert 5 in m.entries and m.dirty.is_set()  # the list is updated too
+    assert 5 in lists(client)[2].entries and lists(client)[2].dirty.is_set()  # the list is updated too
 
 
 def test_repeated_edits_without_new_emotes_cost_nothing():
     # e.g. an LFG bot updating its signup count on every signup
-    m = mapping()
-    sent = fake_message(f"{EVENT} {SHIELD} {CUSTOM}", mid=5, fail=(CUSTOM,))  # CUSTOM can't be used
+    client, _ = client_for((1, 2))
+    send(client, sent := fake_message(f"{EVENT} {SHIELD} {CUSTOM}", mid=5, fail=(CUSTOM,)))  # CUSTOM unusable
     edits = [fake_message(f"{EVENT} {SHIELD} {CUSTOM} ({n} signed up)", mid=5, fail=(CUSTOM,)) for n in range(5)]
-    send_then_edit(m, sent, *edits)
+    for e in edits:
+        edit(client, e)
     assert sent.calls == [SHIELD]
     assert all(e.calls == [] for e in edits)  # the failed one isn't retried either
 
 
 def test_renamed_custom_emote_and_variation_selector_are_the_same_emote():
-    m = mapping()
-    sent = fake_message(f"{EVENT} <:tank:111> ⚔️", mid=5)
-    edited = fake_message(f"{EVENT} <:tank_new:111> ⚔", mid=5)  # renamed emoji, selector dropped
-    send_then_edit(m, sent, edited)
+    client, _ = client_for((1, 2))
+    send(client, fake_message(f"{EVENT} <:tank:111> \u2694\ufe0f", mid=5))
+    edit(client, edited := fake_message(f"{EVENT} <:tank_new:111> \u2694", mid=5))  # renamed, selector dropped
     assert edited.calls == []
 
 
 def test_first_edit_of_a_post_from_before_startup_only_records_it():
-    m = mapping()
-    first = fake_message(f"{EVENT} {SHIELD}", mid=5)  # sent before the bot started: not seen
-    second = fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5)
-    send_then_edit(m, None, first, second)
+    client, _ = client_for((1, 2))
+    edit(client, first := fake_message(f"{EVENT} {SHIELD}", mid=5))  # sent before the bot started
+    edit(client, second := fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5))
     assert first.calls == []  # existing posts never get reactions
     assert second.calls == [HEART]  # but emotes added afterwards do
 
 
 def test_editing_a_chat_message_into_an_event_reacts():
-    m = mapping()
-    sent = fake_message(f"raid tonight? {SHIELD}", mid=5)  # no time yet: not an event
-    edited = fake_message(f"{EVENT} {SHIELD}", mid=5)
-    send_then_edit(m, sent, edited)
+    client, _ = client_for((1, 2))
+    send(client, sent := fake_message(f"raid tonight? {SHIELD}", mid=5))  # no time yet: not an event
+    edit(client, edited := fake_message(f"{EVENT} {SHIELD}", mid=5))
     assert sent.calls == [] and edited.calls == [SHIELD]
 
 
 def test_edited_forward_gets_no_reactions():
-    m = mapping()
-    sent = fake_message(f"{EVENT} {SHIELD}", mid=5, reference=FORWARD)
-    edited = fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5, reference=FORWARD)
-    send_then_edit(m, sent, edited)
+    client, _ = client_for((1, 2))
+    send(client, sent := fake_message(f"{EVENT} {SHIELD}", mid=5, reference=FORWARD))
+    edit(client, edited := fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5, reference=FORWARD))
     assert sent.calls == edited.calls == []
 
 
 def test_deleting_a_post_forgets_its_emotes():
-    m = mapping()
-    asyncio.run(m.on_message(fake_message(f"{EVENT} {SHIELD}", mid=5)))
-    m.forget({5}, 1)
-    assert 5 not in m.seen_emotes
+    client, _ = client_for((1, 2))
+    send(client, fake_message(f"{EVENT} {SHIELD}", mid=5))
+    asyncio.run(client.on_raw_message_delete(NS(message_id=5, channel_id=1)))
+    assert 5 not in client.reactions[1].seen_emotes and 5 not in lists(client)[2].entries
 
 
 def test_emote_memory_is_bounded(monkeypatch):
     import bot
 
     monkeypatch.setattr(bot, "REACTION_MEMORY", 3)
-    m = mapping()
+    client, _ = client_for((1, 2))
     for mid in range(1, 6):
-        asyncio.run(m.on_message(fake_message(f"{EVENT} {SHIELD}", mid=mid)))
-    assert list(m.seen_emotes) == [3, 4, 5]
+        send(client, fake_message(f"{EVENT} {SHIELD}", mid=mid))
+    assert list(client.reactions[1].seen_emotes) == [3, 4, 5]
 
 
 def test_rescan_lists_existing_posts_but_never_reacts():
@@ -228,50 +235,79 @@ def test_rescan_lists_existing_posts_but_never_reacts():
     source.history = posts
     target = NS(name="list", history=nothing)
     config = Config(token="x", mappings=(), preview_lines=3, history_limit=None, keep_seconds=1e12)
-    m = Mapping(NS(get_channel={1: source, 2: target}.get, user=None), MappingConfig(1, 2), config)
+    m = Mapping(NS(get_channel={1: source, 2: target}.get, user=None), 2, (1,), config)
     m.check_channels = lambda: []
     asyncio.run(m.rescan())
     assert 5 in m.entries  # still listed
     assert existing.calls == []  # startup and rescans never add reactions
 
 
+# --- several lists and sources ---
+
+def test_shared_source_post_is_listed_everywhere_and_reacted_to_once():
+    client, _ = client_for((1, 2), (1, 3))
+    send(client, message := fake_message(f"{EVENT} {SHIELD}", mid=5))
+    assert 5 in lists(client)[2].entries and 5 in lists(client)[3].entries
+    assert message.calls == [SHIELD]  # once, not once per list
+
+
+def test_list_collects_posts_from_all_its_sources():
+    client, _ = client_for((1, 3), (4, 3))
+    send(client, a := fake_message(f"{EVENT} {SHIELD}", mid=5, channel_id=1))
+    send(client, b := fake_message(f"{EVENT} {HEART}", mid=6, channel_id=4))
+    assert {5, 6} <= lists(client)[3].entries.keys()
+    assert a.calls == [SHIELD] and b.calls == [HEART]
+
+
+def test_edit_in_a_shared_source_updates_every_list():
+    client, _ = client_for((1, 2), (1, 3))
+    send(client, fake_message(f"chat {SHIELD}", mid=5))  # not an event yet
+    edit(client, edited := fake_message(f"{EVENT} {SHIELD}", mid=5))
+    assert 5 in lists(client)[2].entries and 5 in lists(client)[3].entries
+    assert edited.calls == [SHIELD]
+
+
+def test_missing_add_reactions_in_one_source_only_affects_that_source():
+    client, channels = client_for((1, 3), (4, 3))
+    channels[4] = FakeChannel("src4", **VISIBLE, add_reactions=False)
+    send(client, a := fake_message(f"{EVENT} {SHIELD}", mid=5, channel_id=1))
+    send(client, b := fake_message(f"{EVENT} {HEART}", mid=6, channel_id=4))
+    assert a.calls == [SHIELD] and b.calls == []
+    assert {5, 6} <= lists(client)[3].entries.keys()  # both still listed
+
+
 # --- the optional Add Reactions permission ---
 
 def test_without_add_reactions_the_post_is_listed_with_one_warning(caplog):
-    m = mapping(add_reactions=False)
+    client, _ = client_for((1, 2), add_reactions=False)
     first, second = fake_message(f"{EVENT} {SHIELD}", mid=5), fake_message(f"{EVENT} {HEART}", mid=6)
     with caplog.at_level(logging.WARNING, logger="haskhabot"):
-        asyncio.run(m.on_message(first))
-        asyncio.run(m.on_message(second))
+        send(client, first)
+        send(client, second)
     assert first.calls == second.calls == []  # no doomed API calls
-    assert {5, 6} <= m.entries.keys() and m.dirty.is_set()  # the list still updates
+    assert {5, 6} <= lists(client)[2].entries.keys() and lists(client)[2].dirty.is_set()  # the list still updates
     warnings = [r for r in caplog.records if "Add Reactions" in r.getMessage()]
     assert len(warnings) == 1  # warned once, not per post or per emote
 
 
 def test_regaining_add_reactions_is_logged_and_reacting_resumes(caplog):
-    channels = {1: FakeChannel("src", **VISIBLE, add_reactions=False)}
-    m = Mapping(NS(get_channel=channels.get, user=None), MappingConfig(1, 2), CONFIG)
-    assert m.check_reactions() is False
-    channels[1] = FakeChannel("src", **VISIBLE, add_reactions=True)
+    client, channels = client_for((1, 2), add_reactions=False)
+    assert client.reactions[1].check() is False
+    channels[1] = FakeChannel("src1", **VISIBLE, add_reactions=True)
     with caplog.at_level(logging.INFO, logger="haskhabot"):
-        assert m.check_reactions() is True
+        assert client.reactions[1].check() is True
     assert any("is back" in r.getMessage() for r in caplog.records)
-    message = fake_message(f"{EVENT} {SHIELD}")
-    asyncio.run(m.on_message(message))
+    send(client, message := fake_message(f"{EVENT} {SHIELD}"))
     assert message.calls == [SHIELD]
 
 
-def test_periodic_check_warns_when_add_reactions_is_removed(caplog):
-    channels = {1: FakeChannel("src", **VISIBLE, add_reactions=True)}
-    m = Mapping(NS(get_channel=channels.get, user=None), MappingConfig(1, 2), CONFIG)
-    m.target = object()  # working
-    m.check_channels = lambda: []
-    channels[1] = FakeChannel("src", **VISIBLE, add_reactions=False)
+def test_check_warns_when_add_reactions_is_removed(caplog):
+    client, channels = client_for((1, 2))
+    assert client.reactions[1].check() is True
+    channels[1] = FakeChannel("src1", **VISIBLE, add_reactions=False)
     with caplog.at_level(logging.WARNING, logger="haskhabot"):
-        asyncio.run(m.recheck_access())
-    assert any("Add Reactions" in r.getMessage() for r in caplog.records)
-    assert m.target is not None  # not treated as lost access
+        assert client.reactions[1].check() is False
+    assert any("Missing Add Reactions" in r.getMessage() for r in caplog.records)
 
 
 # --- /listsignups ---
@@ -301,13 +337,15 @@ def test_signup_rows_counts_what_the_bot_placed_minus_the_bot():
 
 
 def test_event_in_thread():
-    m = mapping()
+    m = Mapping(None, 3, (1, 4), CONFIG)  # a list collecting sources 1 and 4
     m.entries[10] = Entry(timestamp=1, author_id=1, preview="", url="u", message_id=10)
     m.entries[11] = Entry(timestamp=1, author_id=1, preview="", url="u", message_id=11, forwarded=True)
+    m.entries[12] = Entry(timestamp=1, author_id=1, preview="", url="u", message_id=12)
 
     assert m.event_in_thread(NS(id=10, parent_id=1)) is m.entries[10]
-    assert m.event_in_thread(NS(id=10, parent_id=2)) is None  # a thread in the list channel
-    assert m.event_in_thread(NS(id=12, parent_id=1)) is None  # not an event post
+    assert m.event_in_thread(NS(id=12, parent_id=4)) is m.entries[12]  # either source works
+    assert m.event_in_thread(NS(id=10, parent_id=3)) is None  # a thread in the list channel
+    assert m.event_in_thread(NS(id=13, parent_id=1)) is None  # not an event post
     assert m.event_in_thread(NS(id=11, parent_id=1)) is None  # a forward
     assert m.event_in_thread(NS(id=1)) is None  # not a thread at all
 
