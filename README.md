@@ -7,6 +7,21 @@ list 4 hours after they start (configurable).
 The bot keeps no database. On startup it rescans the source channel, then follows new, edited and
 deleted posts, editing its own list messages in place.
 
+## What gets listed
+
+- **Timestamps** anywhere in a post: its text, embeds, or layout components (the newer message
+  format some bots use). A post with several timestamps (e.g. start and end) is listed under the
+  earliest.
+- **"on fill"** (also "on-fill", "onfill", any case): the event starts as soon as enough people
+  join. It's listed at the time it was posted and shown as *On fill*. If the post also has an
+  earlier timestamp, that wins.
+- **Forwards**: a post forwarded from another server is read from Discord's copy of the original,
+  so the bot doesn't need to be in that server. The entry links to the original and shows
+  *fwd by* the member who forwarded it. The copy is frozen: later edits to the original aren't seen.
+
+Each entry starts with a random custom emoji from the server, which stays the same for that event.
+Plain links to messages in other servers can't be read: the bot only sees servers it's in.
+
 ## Create the bot in Discord
 
 1. Go to <https://discord.com/developers/applications> → **New Application**.
@@ -52,4 +67,11 @@ With Docker:
 ```bash
 docker build -t haskhabot .
 docker run -d --name haskhabot --env-file .env --restart unless-stopped haskhabot
+```
+
+## Tests
+
+```bash
+.venv/Scripts/pip install -r requirements-dev.txt   # Windows; .venv/bin/pip on Linux
+.venv/Scripts/python -m pytest
 ```
