@@ -33,7 +33,8 @@ Plain links to messages in other servers can't be read: the bot only sees server
    `https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot%20applications.commands&permissions=347200`
    (View Channels, Send Messages, Embed Links, Read Message History, Add Reactions, Use External Emojis.)
    Already invited the bot? Open the new URL again to re-invite it: the `/listsignups` command and the
-   reactions need the extra scope and permissions. The command can take up to an hour to appear the first time.
+   reactions need the extra scope and permissions. The command registers when the bot starts and should show
+   up right away; if it doesn't, reload Discord (Ctrl+R) and check the bot's log for "Couldn't register".
 4. In Discord: **User Settings → Advanced → Developer Mode** on, then right-click each channel →
    **Copy Channel ID** for each source and list channel you'll put in `mappings.json`.
 
