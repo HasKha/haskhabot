@@ -77,8 +77,11 @@ Posts made while the bot was offline get theirs on startup, as long as they're s
 newly written emotes and never remove existing reactions.
 
 In the thread started from an event post, `/listsignups` replies with one line per signup emote: the
-count and who reacted. Only the bot's own emotes are listed, and the bot itself isn't counted. Anywhere
-else it tells you to run it in an event's thread.
+count and who reacted. It lists the emotes the bot placed plus any emote written in the post that people
+added themselves (such as one from another server the bot couldn't react with); other reactions are
+ignored, and the bot itself isn't counted. Anywhere else it tells you to run it in an event's thread.
+Custom emotes are matched by ID, so renaming an emote doesn't matter. The bot can only add a reaction
+for an emote from a server it is in, and needs Use External Emojis for emotes from other servers.
 
 ## Run
 
