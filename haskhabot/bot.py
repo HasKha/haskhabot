@@ -84,7 +84,9 @@ class HaskhaBot(discord.Client):
         thread = interaction.channel
         parent_id = getattr(thread, "parent_id", None)
         found = [m for m in self.by_channel.get(parent_id, []) if m.event_in_thread(thread) is not None]
-        source = self.get_channel(parent_id) if found else None
+        # A reaction channel needn't be a source, so its posts may not be listed anywhere: the reactions
+        # themselves tell whether it's a signup post (the bot only reacts to event posts).
+        source = self.get_channel(parent_id) if found or parent_id in self.reactions else None
         if source is None:
             await interaction.response.send_message(NOT_AN_EVENT_THREAD, ephemeral=True)
             return

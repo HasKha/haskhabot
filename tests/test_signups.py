@@ -11,7 +11,7 @@ import discord
 import pytest
 from conftest import FakeChannel
 
-from haskhabot import signups
+from haskhabot import bot, signups
 from haskhabot.bot import HaskhaBot
 from haskhabot.events import Entry
 from haskhabot.mapping import Mapping
@@ -381,6 +381,47 @@ def test_event_in_thread():
     assert m.event_in_thread(NS(id=13, parent_id=1)) is None  # not an event post
     assert m.event_in_thread(NS(id=11, parent_id=1)) is None  # a forward
     assert m.event_in_thread(NS(id=1)) is None  # not a thread at all
+
+
+def run_listsignups(client, thread, post):
+    """Run /listsignups in `thread`, whose starter post is `post`; returns what the bot replied."""
+    replies = []
+
+    async def reply(content=None, *, embed=None, ephemeral=False):
+        replies.append(embed.description if embed else content)
+
+    async def defer():
+        pass
+
+    async def fetch_message(message_id):
+        return post
+
+    client._connection.user = NS(id=99)
+    if (source := client.get_channel(thread.parent_id)) is not None:
+        source.fetch_message = fetch_message
+    interaction = NS(channel=thread, response=NS(send_message=reply, defer=defer), followup=NS(send=reply))
+    asyncio.run(client.list_signups(interaction))
+    return replies
+
+
+def test_listsignups_in_a_listed_source():
+    client, _ = client_for((1, 2), reaction_channels=())
+    post = fake_message(EVENT, mid=5, reactions=[reaction(SHIELD, [99, 6])])
+    lists(client)[2].ingest(post)
+    assert run_listsignups(client, NS(id=5, parent_id=1), post) == [f"{SHIELD} **1**: <@6>"]
+
+
+def test_listsignups_in_a_reaction_only_channel():
+    client, _ = client_for((1, 2), reaction_channels=(9,))
+    post = fake_message(EVENT, channel_id=9, mid=5, reactions=[reaction(SHIELD, [99, 6])])
+    assert run_listsignups(client, NS(id=5, parent_id=9), post) == [f"{SHIELD} **1**: <@6>"]
+
+
+def test_listsignups_elsewhere_is_refused():
+    client, _ = client_for((1, 2), reaction_channels=())
+    post = fake_message("chat", mid=5)
+    assert run_listsignups(client, NS(id=5, parent_id=1), post) == [bot.NOT_AN_EVENT_THREAD]  # not an event
+    assert run_listsignups(client, NS(id=5, parent_id=8), post) == [bot.NOT_AN_EVENT_THREAD]  # unknown channel
 
 
 # --- startup ---

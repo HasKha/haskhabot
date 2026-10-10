@@ -43,9 +43,9 @@ and allow it for the bot.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in the token. With Docker, pass the same file via
-`--env-file` or a compose `env_file:`. Copy `config.example.json` to `config.json`
-(git-ignored) and list your channel pairs under `mappings`:
+Copy `.env.example` to `.env` and fill in the token; real environment variables override it. With
+Docker, pass the same file via `--env-file` or a compose `env_file:`. Copy `config.example.json` to
+`config.json` (git-ignored) and list your channel pairs under `mappings`:
 
 ```json
 {
@@ -61,19 +61,20 @@ Copy `.env.example` to `.env` and fill in the token. With Docker, pass the same 
 Each pair sends one source channel's events to one list channel. A source can feed several lists and
 a list can collect several sources: above, the first source's events appear in both lists, and the
 second list combines both sources into one list. A channel can't be both a source and a list. IDs are
-plain numbers (no quotes).
+plain numbers (no quotes). Unknown keys are rejected, so a misspelled setting stops the bot with an error
+instead of being ignored.
 
 Each list channel works on its own: if one can't be reached (wrong ID, missing permissions in it or
 in one of its sources), the bot logs it and keeps retrying while the other lists carry on. After
 editing `config.json`, restart the bot.
 
-The settings below apply to every pair.
+The settings below apply to every pair. `.env` and relative paths, like the default `config.json`,
+are looked up in the working directory: run the bot from the folder that holds them.
 
 | Variable | |
 |---|---|
 | `DISCORD_TOKEN` | Bot token (required) |
-| `CONFIG_FILE` | Path to the config file (default: `config.json` in the working directory) |
-| `SOURCE_CHANNEL_ID`, `LIST_CHANNEL_ID` | A single pair, used only if there is no `config.json` |
+| `CONFIG_FILE` | Path to the config file (default: `config.json`) |
 | `PREVIEW_LINES` | Lines of each post shown in the list (default 3) |
 | `HISTORY_LIMIT` | Messages to scan on startup (default: whole channel) |
 | `KEEP_AFTER_START_HOURS` | How long an event stays listed after it starts (default 4) |
@@ -90,7 +91,8 @@ before the bot started: the first edit the bot sees of such a post only records 
 Reactions are added in the source channels unless `reaction_channels` in `config.json` says otherwise.
 It is separate from `mappings`: list a channel there to react in it without listing its posts, or leave
 a source out to list its posts without reacting (`"reaction_channels": []` turns reactions off). A list
-channel can't be a reaction channel. (`/listsignups` works only in threads of listed posts.)
+channel can't be a reaction channel. `/listsignups` works in threads of both listed posts and reaction
+channels' posts.
 
 This needs the **Add Reactions** permission in each reaction channel. Without it the bot logs one warning,
 doesn't react, and keeps the list and `/listsignups` working; it notices within a minute when the
@@ -119,8 +121,7 @@ docker run -d --name haskhabot --env-file .env -v ./config.json:/app/config.json
 
 Create `config.json` before starting: if it's missing, Docker mounts an empty directory in its
 place and the bot exits with "Can't read /app/config.json". With Compose, the same mount is
-`volumes: ["./config.json:/app/config.json:ro"]`. Leave the mount out to use
-`SOURCE_CHANNEL_ID` / `LIST_CHANNEL_ID` from `.env` instead.
+`volumes: ["./config.json:/app/config.json:ro"]`.
 
 ## Tests
 

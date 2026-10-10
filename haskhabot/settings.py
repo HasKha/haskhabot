@@ -1,8 +1,10 @@
-"""Settings: config.json (or the legacy channel-pair env vars) and the .env values."""
+"""Settings: channels in config.json, the token and tuning in environment variables (or .env).
+
+Relative paths, including the defaults, are relative to the working directory.
+"""
 
 from __future__ import annotations
 
-import collections.abc
 import json
 import os
 import sys
@@ -12,6 +14,9 @@ from typing import Iterable
 
 from dotenv import load_dotenv
 
+CONFIG_KEYS = ("mappings", "reaction_channels")
+MAPPING_KEYS = ("source", "list")
+
 
 @dataclass(frozen=True)
 class MappingConfig:
@@ -19,49 +24,47 @@ class MappingConfig:
     list_id: int
 
 
-def env_channel_id(env: collections.abc.Mapping[str, str], name: str) -> int:
-    try:
-        return int(env[name])
-    except ValueError:
-        raise ValueError(f"{name} must be a channel ID (digits only), got {env[name]!r}") from None
+def check_keys(where: str, item: dict, allowed: tuple[str, ...]) -> None:
+    """Reject keys we don't know, so a typo fails loudly instead of quietly falling back to a default."""
+    unknown = [k for k in item if k not in allowed]
+    if unknown:
+        raise ValueError(f"{where}: unknown key {', '.join(map(json.dumps, unknown))} "
+                         f"(expected {', '.join(map(json.dumps, allowed))})")
 
 
-def read_config_file(
-    path: Path, env: collections.abc.Mapping[str, str]
-) -> tuple[tuple[MappingConfig, ...], tuple[int, ...] | None]:
-    """(mappings, reaction channels) from the JSON file, else the legacy SOURCE_CHANNEL_ID/LIST_CHANNEL_ID pair.
+def read_config_file(path: Path) -> tuple[tuple[MappingConfig, ...], tuple[int, ...] | None]:
+    """(mappings, reaction channels) from the JSON file.
 
     Reaction channels are None when the file doesn't set "reaction_channels": react in the source channels.
-    Raises ValueError with a readable message if the settings are missing or invalid.
+    Raises ValueError with a readable message if the file is missing or invalid.
     """
-    reaction_channels = None
-    if path.exists():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8-sig"))  # -sig: Notepad adds a BOM
-        except json.JSONDecodeError as e:
-            raise ValueError(f"{path} is not valid JSON: {e}") from e
-        except (OSError, UnicodeDecodeError) as e:
-            # e.g. a directory: Docker creates one when bind-mounting a host file that doesn't exist.
-            raise ValueError(f"Can't read {path}: {e}") from e
-        items = raw.get("mappings") if isinstance(raw, dict) else None
-        if not isinstance(items, list) or not items:
-            raise ValueError(f'{path} must be an object with a non-empty "mappings" list of '
-                             '{"source": ..., "list": ...} objects')
-        mappings = []
-        for i, item in enumerate(items, 1):
-            # type() is int, not isinstance: rejects "123" strings and true/false.
-            if not isinstance(item, dict) or not all(type(item.get(k)) is int for k in ("source", "list")):
-                raise ValueError(f'{path} mappings entry {i} needs integer "source" and "list" channel IDs (no quotes)')
-            mappings.append(MappingConfig(item["source"], item["list"]))
-        reaction_channels = raw.get("reaction_channels")
-        if reaction_channels is not None:
-            if not isinstance(reaction_channels, list) or not all(type(c) is int for c in reaction_channels):
-                raise ValueError(f'{path} "reaction_channels" must be a list of integer channel IDs (no quotes)')
-            reaction_channels = tuple(dict.fromkeys(reaction_channels))
-    elif env.get("SOURCE_CHANNEL_ID") and env.get("LIST_CHANNEL_ID"):
-        mappings = [MappingConfig(env_channel_id(env, "SOURCE_CHANNEL_ID"), env_channel_id(env, "LIST_CHANNEL_ID"))]
-    else:
-        raise ValueError(f"No mappings: create {path} or set SOURCE_CHANNEL_ID and LIST_CHANNEL_ID")
+    if not path.exists():
+        raise ValueError(f"{path.resolve()} not found: copy config.example.json to it, or set CONFIG_FILE")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))  # -sig: Notepad adds a BOM
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path} is not valid JSON: {e}") from e
+    except (OSError, UnicodeDecodeError) as e:
+        # e.g. a directory: Docker creates one when bind-mounting a host file that doesn't exist.
+        raise ValueError(f"Can't read {path}: {e}") from e
+    if isinstance(raw, dict):
+        check_keys(str(path), raw, CONFIG_KEYS)
+    items = raw.get("mappings") if isinstance(raw, dict) else None
+    if not isinstance(items, list) or not items:
+        raise ValueError(f'{path} must be an object with a non-empty "mappings" list of '
+                         '{"source": ..., "list": ...} objects')
+    mappings = []
+    for i, item in enumerate(items, 1):
+        # type() is int, not isinstance: rejects "123" strings and true/false.
+        if not isinstance(item, dict) or not all(type(item.get(k)) is int for k in MAPPING_KEYS):
+            raise ValueError(f'{path} mappings entry {i} needs integer "source" and "list" channel IDs (no quotes)')
+        check_keys(f"{path} mappings entry {i}", item, MAPPING_KEYS)
+        mappings.append(MappingConfig(item["source"], item["list"]))
+    reaction_channels = raw.get("reaction_channels")
+    if reaction_channels is not None:
+        if not isinstance(reaction_channels, list) or not all(type(c) is int for c in reaction_channels):
+            raise ValueError(f'{path} "reaction_channels" must be a list of integer channel IDs (no quotes)')
+        reaction_channels = tuple(dict.fromkeys(reaction_channels))
 
     # A source may feed several lists and a list may collect several sources, but a channel can't be
     # both: the bot would read its own list embeds as event posts.
@@ -97,12 +100,12 @@ class Config:
 
 
 def load_config() -> Config:
-    load_dotenv()
+    # Real environment variables win over .env, so Docker's env_file and `docker run -e` behave as expected.
+    load_dotenv(".env")
     if not os.getenv("DISCORD_TOKEN"):
-        sys.exit("Missing required settings in .env: DISCORD_TOKEN")
-    path = Path(os.getenv("CONFIG_FILE") or "config.json")
+        sys.exit("Missing required setting DISCORD_TOKEN (set it in the environment or in .env)")
     try:
-        mappings, reaction_channels = read_config_file(path, os.environ)
+        mappings, reaction_channels = read_config_file(Path(os.getenv("CONFIG_FILE") or "config.json"))
     except ValueError as e:
         sys.exit(str(e))
     history = os.getenv("HISTORY_LIMIT", "").strip()

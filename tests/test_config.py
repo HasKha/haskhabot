@@ -2,12 +2,13 @@
 
 import asyncio
 import json
+import os
 from types import SimpleNamespace as NS
 
 import pytest
 
 from haskhabot.bot import HaskhaBot
-from haskhabot.settings import Config, MappingConfig, group_by_list, read_config_file
+from haskhabot.settings import Config, MappingConfig, group_by_list, load_config, read_config_file
 from haskhabot.events import Entry
 from haskhabot.mapping import Mapping
 
@@ -16,20 +17,19 @@ from haskhabot.mapping import Mapping
 def load_file(tmp_path):
     """read_config_file against a file holding `data` (str written as-is, else JSON), or no file if None."""
 
-    def load_file(data, env=None):
+    def load_file(data):
         path = tmp_path / "config.json"
         if data is not None:
             path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
-        return read_config_file(path, env or {})
+        return read_config_file(path)
 
     return load_file
 
 
 @pytest.fixture
 def load(load_file):
-    """Just the mappings, from a file whose "mappings" is `data` (None: no file)."""
-    return lambda data, env=None: load_file(None if data is None else {"mappings": data}, env)[0]
-
+    """Just the mappings, from a file whose "mappings" is `data`."""
+    return lambda data: load_file({"mappings": data})[0]
 
 def config(*mappings):
     return Config(token="x", mappings=mappings, preview_lines=3, history_limit=None, keep_seconds=0)
@@ -89,12 +89,44 @@ def test_unreadable_path_is_a_readable_error(tmp_path):
     path = tmp_path / "config.json"
     path.mkdir()
     with pytest.raises(ValueError, match="Can't read"):
-        read_config_file(path, {})
+        read_config_file(path)
 
 
-def test_file_wins_over_env(load):
-    assert load([{"source": 1, "list": 2}], {"SOURCE_CHANNEL_ID": "5", "LIST_CHANNEL_ID": "6"}) == (MappingConfig(1, 2),)
+def test_missing_file_is_an_error(load_file):
+    with pytest.raises(ValueError, match="config.json not found: copy config.example.json"):
+        load_file(None)
 
+
+@pytest.mark.parametrize("data, message", [
+    ({"mappings": [{"source": 1, "list": 2}], "reaction_channel": []}, 'unknown key "reaction_channel"'),
+    ({"mapping": [{"source": 1, "list": 2}]}, 'unknown key "mapping"'),
+    ({"mappings": [{"source": 1, "list": 2, "lsit": 3}]}, 'mappings entry 1: unknown key "lsit"'),
+])
+def test_unknown_keys_are_rejected(load_file, data, message):
+    with pytest.raises(ValueError, match=message):
+        load_file(data)
+
+
+def test_load_config_reads_from_the_working_directory(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("DISCORD_TOKEN=abc\n", encoding="utf-8")
+    (tmp_path / "config.json").write_text(json.dumps({"mappings": [{"source": 1, "list": 2}]}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    for name in ("DISCORD_TOKEN", "CONFIG_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    try:
+        loaded = load_config()
+    finally:
+        os.environ.pop("DISCORD_TOKEN", None)  # load_dotenv set it outside monkeypatch's control
+    assert loaded.token == "abc" and loaded.mappings == (MappingConfig(1, 2),)
+
+
+def test_config_file_env_var_picks_the_file(tmp_path, monkeypatch):
+    other = tmp_path / "elsewhere.json"
+    other.write_text(json.dumps({"mappings": [{"source": 3, "list": 4}]}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DISCORD_TOKEN", "abc")
+    monkeypatch.setenv("CONFIG_FILE", str(other))
+    assert load_config().mappings == (MappingConfig(3, 4),)
 
 # --- reaction_channels ---
 
@@ -119,32 +151,6 @@ def test_reaction_channels(load_file, extra, expected):
 def test_invalid_reaction_channels(load_file, value, message):
     with pytest.raises(ValueError, match=message):
         load_file({"mappings": [MAPPING], "reaction_channels": value})
-
-
-def test_env_fallback_reacts_in_the_sources(load_file):
-    assert load_file(None, {"SOURCE_CHANNEL_ID": "5", "LIST_CHANNEL_ID": "6"})[1] is None
-
-
-# --- SOURCE_CHANNEL_ID / LIST_CHANNEL_ID fallback ---
-
-def test_env_fallback(load):
-    assert load(None, {"SOURCE_CHANNEL_ID": "5", "LIST_CHANNEL_ID": "6"}) == (MappingConfig(5, 6),)
-
-
-@pytest.mark.parametrize("env", [{"SOURCE_CHANNEL_ID": "5"}, {}])
-def test_env_fallback_needs_both(load, env):
-    with pytest.raises(ValueError, match="No mappings"):
-        load(None, env)
-
-
-def test_env_fallback_still_validated(load):
-    with pytest.raises(ValueError, match="both a source and a list"):
-        load(None, {"SOURCE_CHANNEL_ID": "5", "LIST_CHANNEL_ID": "5"})
-
-
-def test_env_fallback_names_a_bad_id(load):
-    with pytest.raises(ValueError, match="SOURCE_CHANNEL_ID must be a channel ID.*'12x'"):
-        load(None, {"SOURCE_CHANNEL_ID": "12x", "LIST_CHANNEL_ID": "6"})
 
 
 # --- routing ---
