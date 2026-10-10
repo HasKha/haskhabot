@@ -36,41 +36,45 @@ Plain links to messages in other servers can't be read: the bot only sees server
    reactions need the extra scope and permissions. The command registers when the bot starts and should show
    up right away; if it doesn't, reload Discord (Ctrl+R) and check the bot's log for "Couldn't register".
 4. In Discord: **User Settings → Advanced → Developer Mode** on, then right-click each channel →
-   **Copy Channel ID** for each source and list channel you'll put in `mappings.json`.
+   **Copy Channel ID** for each source and list channel you'll put in `config.json`.
 
 Use a dedicated list channel where only the bot can post: deny **Send Messages** for `@everyone`
 and allow it for the bot.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in the token. With Docker, pass the same file via
-`--env-file` or a compose `env_file:`. Copy `mappings.example.json` to `mappings.json`
-(git-ignored) and list your channel pairs:
+Copy `.env.example` to `.env` and fill in the token; real environment variables override it. With
+Docker, pass the same file via `--env-file` or a compose `env_file:`. Copy `config.example.json` to
+`config.json` (git-ignored) and list your channel pairs under `mappings`:
 
 ```json
-[
-  {"source": 111111111111111111, "list": 222222222222222222},
-  {"source": 111111111111111111, "list": 444444444444444444},
-  {"source": 333333333333333333, "list": 444444444444444444}
-]
+{
+  "mappings": [
+    {"source": 111111111111111111, "list": 222222222222222222},
+    {"source": 111111111111111111, "list": 444444444444444444},
+    {"source": 333333333333333333, "list": 444444444444444444}
+  ],
+  "reaction_channels": [111111111111111111]
+}
 ```
 
 Each pair sends one source channel's events to one list channel. A source can feed several lists and
 a list can collect several sources: above, the first source's events appear in both lists, and the
 second list combines both sources into one list. A channel can't be both a source and a list. IDs are
-plain numbers (no quotes).
+plain numbers (no quotes). Unknown keys are rejected, so a misspelled setting stops the bot with an error
+instead of being ignored.
 
 Each list channel works on its own: if one can't be reached (wrong ID, missing permissions in it or
 in one of its sources), the bot logs it and keeps retrying while the other lists carry on. After
-editing `mappings.json`, restart the bot.
+editing `config.json`, restart the bot.
 
-The settings below apply to every pair.
+The settings below apply to every pair. `.env` and relative paths, like the default `config.json`,
+are looked up in the working directory: run the bot from the folder that holds them.
 
 | Variable | |
 |---|---|
 | `DISCORD_TOKEN` | Bot token (required) |
-| `MAPPINGS_FILE` | Path to the mappings file (default: `mappings.json` next to `bot.py`) |
-| `SOURCE_CHANNEL_ID`, `LIST_CHANNEL_ID` | A single pair, used only if there is no `mappings.json` |
+| `CONFIG_FILE` | Path to the config file (default: `config.json`) |
 | `PREVIEW_LINES` | Lines of each post shown in the list (default 3) |
 | `HISTORY_LIMIT` | Messages to scan on startup (default: whole channel) |
 | `KEEP_AFTER_START_HOURS` | How long an event stays listed after it starts (default 4) |
@@ -84,7 +88,13 @@ use (e.g. a custom one from another server) is skipped with one warning in the l
 editing its own post triggers nothing. Forwards never get reactions, and neither do posts that existed
 before the bot started: the first edit the bot sees of such a post only records its emotes.
 
-This needs the **Add Reactions** permission in the source channel. Without it the bot logs one warning,
+Reactions are added in the source channels unless `reaction_channels` in `config.json` says otherwise.
+It is separate from `mappings`: list a channel there to react in it without listing its posts, or leave
+a source out to list its posts without reacting (`"reaction_channels": []` turns reactions off). A list
+channel can't be a reaction channel. `/listsignups` works in threads of both listed posts and reaction
+channels' posts.
+
+This needs the **Add Reactions** permission in each reaction channel. Without it the bot logs one warning,
 doesn't react, and keeps the list and `/listsignups` working; it notices within a minute when the
 permission is granted.
 
@@ -99,20 +109,19 @@ With Python 3.9+:
 ```bash
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt   # Windows; .venv/bin/pip on Linux
-.venv/Scripts/python bot.py
+.venv/Scripts/python -m haskhabot
 ```
 
-With Docker (the image holds only the code; mount the mappings file so it can change without a rebuild):
+With Docker (the image holds only the code; mount the config file so it can change without a rebuild):
 
 ```bash
 docker build -t haskhabot .
-docker run -d --name haskhabot --env-file .env -v ./mappings.json:/app/mappings.json:ro --restart unless-stopped haskhabot
+docker run -d --name haskhabot --env-file .env -v ./config.json:/app/config.json:ro --restart unless-stopped haskhabot
 ```
 
-Create `mappings.json` before starting: if it's missing, Docker mounts an empty directory in its
-place and the bot exits with "Can't read /app/mappings.json". With Compose, the same mount is
-`volumes: ["./mappings.json:/app/mappings.json:ro"]`. Leave the mount out to use
-`SOURCE_CHANNEL_ID` / `LIST_CHANNEL_ID` from `.env` instead.
+Create `config.json` before starting: if it's missing, Docker mounts an empty directory in its
+place and the bot exits with "Can't read /app/config.json". With Compose, the same mount is
+`volumes: ["./config.json:/app/config.json:ro"]`.
 
 ## Tests
 
@@ -120,3 +129,13 @@ place and the bot exits with "Can't read /app/mappings.json". With Compose, the 
 .venv/Scripts/pip install -r requirements-dev.txt   # Windows; .venv/bin/pip on Linux
 .venv/Scripts/python -m pytest
 ```
+
+## Code layout
+
+Everything is in the `haskhabot/` package; run it with `python -m haskhabot`.
+
+- `bot.py`: the Discord client, event routing and `/listsignups`.
+- `settings.py`: `config.json` and `.env` loading.
+- `events.py`: reading a post into an entry, and rendering the list.
+- `mapping.py`: one list channel and its sources: scanning, syncing and permission checks.
+- `signups.py`: signup emotes, reacting, and the signup tally.

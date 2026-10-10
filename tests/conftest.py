@@ -4,7 +4,7 @@ from types import SimpleNamespace as NS
 
 import discord
 
-# Make bot.py importable from the tests.
+# Make the haskhabot package importable from the tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 

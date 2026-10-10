@@ -8,11 +8,15 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 import discord
-
-from bot import (
-    Config, Entry, HaskhaBot, Mapping, MappingConfig, find_emotes, format_signups, signup_emojis, signup_rows,
-)
+import pytest
 from conftest import FakeChannel
+
+from haskhabot import bot, signups
+from haskhabot.bot import HaskhaBot
+from haskhabot.events import Entry
+from haskhabot.mapping import Mapping
+from haskhabot.settings import Config, MappingConfig
+from haskhabot.signups import find_emotes, format_signups, signup_emojis, signup_rows
 
 SHIELD = "\U0001f6e1️"
 HEART = "\U0001f49a"
@@ -41,14 +45,16 @@ def fake_message(content, *, reference=None, reactions=(), fail=(), channel_id=1
     )
 
 
-def client_for(*pairs, add_reactions=True):
+def client_for(*pairs, add_reactions=True, reaction_channels=None):
     """A built HaskhaBot for (source, list) pairs whose source channels do or don't grant Add Reactions.
 
     Returns the client and its channels dict, which tests can change to simulate permission changes.
     """
     channels = {s: FakeChannel(f"src{s}", **VISIBLE, add_reactions=add_reactions) for s, _ in pairs}
+    for c in reaction_channels or ():
+        channels.setdefault(c, FakeChannel(f"react{c}", **VISIBLE, add_reactions=add_reactions))
     config = Config(token="x", mappings=tuple(MappingConfig(s, l) for s, l in pairs), preview_lines=3,
-                    history_limit=None, keep_seconds=0)
+                    history_limit=None, keep_seconds=0, reaction_channels=reaction_channels)
     client = HaskhaBot(config)
     client.get_channel = channels.get
     client.build()
@@ -212,9 +218,7 @@ def test_deleting_a_post_forgets_its_emotes():
 
 
 def test_emote_memory_is_bounded(monkeypatch):
-    import bot
-
-    monkeypatch.setattr(bot, "REACTION_MEMORY", 3)
+    monkeypatch.setattr(signups, "REACTION_MEMORY", 3)
     client, _ = client_for((1, 2))
     for mid in range(1, 6):
         send(client, fake_message(f"{EVENT} {SHIELD}", mid=mid))
@@ -276,6 +280,35 @@ def test_missing_add_reactions_in_one_source_only_affects_that_source():
     assert {5, 6} <= lists(client)[3].entries.keys()  # both still listed
 
 
+# --- reaction channels are independent of watched sources ---
+
+def test_reaction_channels_can_exclude_a_watched_source():
+    client, _ = client_for((1, 2), reaction_channels=())
+    send(client, message := fake_message(f"{EVENT} {SHIELD}", mid=5))
+    assert message.calls == [] and 5 in lists(client)[2].entries  # listed, not reacted to
+    edit(client, edited := fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5))
+    assert edited.calls == [] and lists(client)[2].entries[5].message_id == 5
+
+
+def test_reaction_channels_can_include_an_unwatched_channel():
+    client, _ = client_for((1, 2), reaction_channels=(9,))
+    send(client, other := fake_message(f"{EVENT} {SHIELD}", channel_id=9))
+    send(client, watched := fake_message(f"{EVENT} {SHIELD}", channel_id=1, mid=2))
+    assert other.calls == [SHIELD] and watched.calls == []
+    assert lists(client)[2].entries.keys() == {2}  # channel 9's post isn't listed
+    edit(client, edited := fake_message(f"{EVENT} {SHIELD} {HEART}", channel_id=9))
+    assert edited.calls == [HEART]
+
+
+@pytest.mark.parametrize("reaction_channels, logged", [((1, 9), "#src1, #react9"), ((), "no channels")])
+def test_startup_logs_where_reactions_are_added(caplog, reaction_channels, logged):
+    client, _ = client_for((1, 2), reaction_channels=reaction_channels)
+    client.mappings = []  # nothing to rescan
+    with caplog.at_level(logging.INFO, logger="haskhabot"):
+        asyncio.run(client.on_ready())
+    assert f"Adding signup reactions in: {logged}" in caplog.text
+
+
 # --- the optional Add Reactions permission ---
 
 def test_without_add_reactions_the_post_is_listed_with_one_warning(caplog):
@@ -296,7 +329,7 @@ def test_regaining_add_reactions_is_logged_and_reacting_resumes(caplog):
     channels[1] = FakeChannel("src1", **VISIBLE, add_reactions=True)
     with caplog.at_level(logging.INFO, logger="haskhabot"):
         assert client.reactions[1].check() is True
-    assert any("is back" in r.getMessage() for r in caplog.records)
+    assert any("back on" in r.getMessage() for r in caplog.records)
     send(client, message := fake_message(f"{EVENT} {SHIELD}"))
     assert message.calls == [SHIELD]
 
@@ -309,6 +342,26 @@ def test_check_warns_when_add_reactions_is_removed(caplog):
         assert client.reactions[1].check() is False
     assert any("Missing Add Reactions" in r.getMessage() for r in caplog.records)
 
+
+def test_a_reaction_channel_that_isnt_found_says_so(caplog):
+    client, channels = client_for((1, 2), reaction_channels=(404,))
+    del channels[404]  # a wrong ID: get_channel finds nothing
+    with caplog.at_level(logging.WARNING, logger="haskhabot"):
+        assert client.reactions[404].check() is False
+        assert client.reactions[404].check() is False
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1 and "[404] Reaction channel not found" in messages[0]  # once, not per check
+    assert "Add Reactions" not in messages[0]
+
+
+def test_startup_log_leaves_out_channels_that_cant_react(caplog):
+    client, channels = client_for((1, 2), (3, 4), reaction_channels=(1, 3))
+    channels[3] = FakeChannel("src3", **VISIBLE, add_reactions=False)
+    client.mappings = []  # nothing to rescan
+    with caplog.at_level(logging.INFO, logger="haskhabot"):
+        asyncio.run(client.on_ready())
+    assert "Adding signup reactions in: #src1\n" in caplog.text + "\n"
+    assert "[#src3] Missing Add Reactions" in caplog.text
 
 # --- /listsignups ---
 
@@ -350,6 +403,47 @@ def test_event_in_thread():
     assert m.event_in_thread(NS(id=1)) is None  # not a thread at all
 
 
+def run_listsignups(client, thread, post):
+    """Run /listsignups in `thread`, whose starter post is `post`; returns what the bot replied."""
+    replies = []
+
+    async def reply(content=None, *, embed=None, ephemeral=False):
+        replies.append(embed.description if embed else content)
+
+    async def defer():
+        pass
+
+    async def fetch_message(message_id):
+        return post
+
+    client._connection.user = NS(id=99)
+    if (source := client.get_channel(thread.parent_id)) is not None:
+        source.fetch_message = fetch_message
+    interaction = NS(channel=thread, response=NS(send_message=reply, defer=defer), followup=NS(send=reply))
+    asyncio.run(client.list_signups(interaction))
+    return replies
+
+
+def test_listsignups_in_a_listed_source():
+    client, _ = client_for((1, 2), reaction_channels=())
+    post = fake_message(EVENT, mid=5, reactions=[reaction(SHIELD, [99, 6])])
+    lists(client)[2].ingest(post)
+    assert run_listsignups(client, NS(id=5, parent_id=1), post) == [f"{SHIELD} **1**: <@6>"]
+
+
+def test_listsignups_in_a_reaction_only_channel():
+    client, _ = client_for((1, 2), reaction_channels=(9,))
+    post = fake_message(EVENT, channel_id=9, mid=5, reactions=[reaction(SHIELD, [99, 6])])
+    assert run_listsignups(client, NS(id=5, parent_id=9), post) == [f"{SHIELD} **1**: <@6>"]
+
+
+def test_listsignups_elsewhere_is_refused():
+    client, _ = client_for((1, 2), reaction_channels=())
+    post = fake_message("chat", mid=5)
+    assert run_listsignups(client, NS(id=5, parent_id=1), post) == [bot.NOT_AN_EVENT_THREAD]  # not an event
+    assert run_listsignups(client, NS(id=5, parent_id=8), post) == [bot.NOT_AN_EVENT_THREAD]  # unknown channel
+
+
 # --- startup ---
 
 def test_a_failing_command_sync_does_not_stop_startup():
@@ -372,10 +466,13 @@ def test_a_failing_command_sync_does_not_stop_startup():
 def test_no_async_comprehension_inside_another_comprehension():
     """A SyntaxError before Python 3.11, which would stop the whole bot starting; the README promises 3.9+."""
     comps = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-    tree = ast.parse((Path(__file__).resolve().parent.parent / "bot.py").read_text(encoding="utf-8"))
-    for outer in ast.walk(tree):
-        if not isinstance(outer, comps):
-            continue
-        for inner in ast.walk(outer):
-            if inner is not outer and isinstance(inner, comps) and any(g.is_async for g in inner.generators):
-                raise AssertionError(f"bot.py:{inner.lineno}: async comprehension inside a comprehension")
+    sources = list(Path(__file__).resolve().parent.parent.glob("haskhabot/*.py"))
+    assert sources  # the check below would pass vacuously on an empty list
+    for source in sources:
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for outer in ast.walk(tree):
+            if not isinstance(outer, comps):
+                continue
+            for inner in ast.walk(outer):
+                if inner is not outer and isinstance(inner, comps) and any(g.is_async for g in inner.generators):
+                    raise AssertionError(f"{source.name}:{inner.lineno}: async comprehension inside a comprehension")
