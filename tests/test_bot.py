@@ -8,7 +8,19 @@ from types import SimpleNamespace as NS
 import discord
 from discord.components import _component_factory
 
-import bot
+from haskhabot import bot
+from haskhabot.events import (
+    BRAILLE_BLANK,
+    EMBED_LIMIT,
+    extract_entry,
+    make_preview,
+    pick_emoji,
+    render_entry,
+    render_pages,
+    upcoming,
+)
+from haskhabot.settings import Config, MappingConfig
+from haskhabot.mapping import EMPTY_EMOJI, MAX_WAIT_SECONDS, Mapping
 from conftest import FakeChannel
 
 POSTED = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
@@ -38,13 +50,13 @@ def snapshot(content="", embeds=(), components=()):
 
 
 def config(**overrides):
-    values = dict(token="x", mappings=(bot.MappingConfig(1, 2),), preview_lines=3,
+    values = dict(token="x", mappings=(MappingConfig(1, 2),), preview_lines=3,
                   history_limit=None, keep_seconds=4 * HOUR)
-    return bot.Config(**{**values, **overrides})
+    return Config(**{**values, **overrides})
 
 
 def mapping(client=None, source=1, list_=2):
-    return bot.Mapping(client, list_, (source,), config())
+    return Mapping(client, list_, (source,), config())
 
 
 class FakeEmoji:
@@ -61,54 +73,54 @@ class FakeEmoji:
 # --- timestamps and previews ---
 
 def test_message_without_timestamp_is_ignored():
-    assert bot.extract_entry(msg("no time here"), 3) is None
+    assert extract_entry(msg("no time here"), 3) is None
 
 
 def test_earliest_timestamp_wins_and_preview_is_cleaned():
-    entry = bot.extract_entry(msg("# Raid night\nStarts <t:1760000000:F> - ends <t:1760007200:t>\n\nBring snacks\nline 4"), 3)
+    entry = extract_entry(msg("# Raid night\nStarts <t:1760000000:F> - ends <t:1760007200:t>\n\nBring snacks\nline 4"), 3)
     assert entry.timestamp == 1760000000
     assert entry.preview == "Raid night\nStarts <t:1760000000:F> - ends <t:1760007200:t>\nBring snacks"
 
 
 def test_timestamps_in_embeds_are_found():
-    entry = bot.extract_entry(msg(embeds=[discord.Embed(title="Movie", description="At <t:1750000000:R>")]), 3)
+    entry = extract_entry(msg(embeds=[discord.Embed(title="Movie", description="At <t:1750000000:R>")]), 3)
     assert entry.timestamp == 1750000000
 
 
 def test_preview_skips_mention_only_lines_and_braille_padding():
-    preview = bot.make_preview("<@&123>" + bot.BRAILLE_BLANK * 20 + "\n**Title**\n<@456> <#789>\nbody", 3)
+    preview = make_preview("<@&123>" + BRAILLE_BLANK * 20 + "\n**Title**\n<@456> <#789>\nbody", 3)
     assert preview == "**Title**\nbody"
 
 
 def test_preview_truncates_long_lines():
-    assert bot.make_preview("x" * 200, 1) == "x" * 119 + "…"
+    assert make_preview("x" * 200, 1) == "x" * 119 + "…"
 
 
 # --- rendering ---
 
 def test_pages_fit_in_embeds():
-    entries = [bot.extract_entry(msg(f"Event {i} <t:{1760000000 + i}>\n" + "x" * 110 + "\ny\nz", i), 3) for i in range(100)]
-    pages = bot.render_pages(entries)
+    entries = [extract_entry(msg(f"Event {i} <t:{1760000000 + i}>\n" + "x" * 110 + "\ny\nz", i), 3) for i in range(100)]
+    pages = render_pages(entries)
     assert len(pages) > 1
-    assert all(len(page) <= bot.EMBED_LIMIT for page in pages)
+    assert all(len(page) <= EMBED_LIMIT for page in pages)
 
 
 def test_pages_are_sorted_by_time():
-    late = bot.extract_entry(msg("late <t:2000000002>", 1), 3)
-    early = bot.extract_entry(msg("early <t:2000000001>", 2), 3)
-    page = bot.render_pages([late, early])[0]
+    late = extract_entry(msg("late <t:2000000002>", 1), 3)
+    early = extract_entry(msg("early <t:2000000001>", 2), 3)
+    page = render_pages([late, early])[0]
     assert page.index("early") < page.index("late")
 
 
 def test_empty_list_text():
-    assert bot.render_pages([]) == ["No events scheduled"]
-    assert bot.render_pages([], (), "custom") == ["custom"]
+    assert render_pages([]) == ["No events scheduled"]
+    assert render_pages([], (), "custom") == ["custom"]
 
 
 def test_empty_text_uses_server_emoji_when_present():
     m = mapping()
-    m.target = NS(guild=NS(emojis=[FakeEmoji("frog", 1), FakeEmoji(bot.EMPTY_EMOJI, 9)]))
-    assert m.empty_text() == f"No events scheduled <:{bot.EMPTY_EMOJI}:9>"
+    m.target = NS(guild=NS(emojis=[FakeEmoji("frog", 1), FakeEmoji(EMPTY_EMOJI, 9)]))
+    assert m.empty_text() == f"No events scheduled <:{EMPTY_EMOJI}:9>"
     m.target = NS(guild=NS(emojis=[FakeEmoji("frog", 1)]))
     assert m.empty_text() == "No events scheduled"
 
@@ -117,77 +129,77 @@ def test_empty_text_uses_server_emoji_when_present():
 
 def test_emoji_pick_is_stable_and_prefixes_entry():
     emojis = ["<:frog:1>", "<:toad:2>", "<a:slime:3>"]
-    entry = bot.extract_entry(msg("a <t:2000000000>", 1111), 3)
-    emoji = bot.pick_emoji(entry, emojis)
-    assert emoji == bot.pick_emoji(entry, emojis)
-    assert bot.render_pages([entry], emojis)[0].startswith(f"{emoji} **<t:2000000000:f>**")
+    entry = extract_entry(msg("a <t:2000000000>", 1111), 3)
+    emoji = pick_emoji(entry, emojis)
+    assert emoji == pick_emoji(entry, emojis)
+    assert render_pages([entry], emojis)[0].startswith(f"{emoji} **<t:2000000000:f>**")
 
 
 def test_no_emojis_means_no_prefix():
-    entry = bot.extract_entry(msg("a <t:2000000000>"), 3)
-    assert bot.pick_emoji(entry, []) == ""
-    assert bot.render_pages([entry])[0].startswith("**<t:")
+    entry = extract_entry(msg("a <t:2000000000>"), 3)
+    assert pick_emoji(entry, []) == ""
+    assert render_pages([entry])[0].startswith("**<t:")
 
 
 # --- listing window ---
 
 def test_events_stay_listed_until_keep_window_passes():
     now = time.time()
-    old = bot.extract_entry(msg("old <t:%d>" % (now - 5 * HOUR), 1), 3)
-    recent = bot.extract_entry(msg("recent <t:%d>" % (now - HOUR), 2), 3)
-    later = bot.extract_entry(msg("later <t:%d>" % (now + 2 * HOUR), 3), 3)
-    assert bot.upcoming([old, recent, later], now, 4 * HOUR) == [recent, later]
+    old = extract_entry(msg("old <t:%d>" % (now - 5 * HOUR), 1), 3)
+    recent = extract_entry(msg("recent <t:%d>" % (now - HOUR), 2), 3)
+    later = extract_entry(msg("later <t:%d>" % (now + 2 * HOUR), 3), 3)
+    assert upcoming([old, recent, later], now, 4 * HOUR) == [recent, later]
 
 
 def test_wakes_up_when_next_event_expires():
     now = time.time()
     m = mapping()
-    m.entries = {1: bot.extract_entry(msg("x <t:%d>" % (now - 4 * HOUR + 60), 1), 3)}
+    m.entries = {1: extract_entry(msg("x <t:%d>" % (now - 4 * HOUR + 60), 1), 3)}
     assert 55 < m.seconds_until_next_expiry() <= 62
     m.entries = {}
-    assert m.seconds_until_next_expiry() == bot.MAX_WAIT_SECONDS
+    assert m.seconds_until_next_expiry() == MAX_WAIT_SECONDS
 
 
 # --- "on fill" ---
 
 def test_on_fill_is_listed_at_posting_time():
-    entry = bot.extract_entry(msg("Raid **On Fill**\nbring pots"), 3)
+    entry = extract_entry(msg("Raid **On Fill**\nbring pots"), 3)
     posted = int(POSTED.timestamp())
     assert entry.timestamp == posted and entry.on_fill
-    assert f"**On fill** (posted <t:{posted}:R>)" in bot.render_entry(entry)
+    assert f"**On fill** (posted <t:{posted}:R>)" in render_entry(entry)
 
 
 def test_on_fill_spellings():
     for text in ("on-fill", "ONFILL", "starts on fill!"):
-        assert bot.extract_entry(msg(text), 3).on_fill, text
+        assert extract_entry(msg(text), 3).on_fill, text
     for text in ("dragon filling", "salmon fillet", "upon filler"):
-        assert bot.extract_entry(msg(text), 3) is None, text
+        assert extract_entry(msg(text), 3) is None, text
 
 
 def test_on_fill_versus_timestamps():
     posted = int(POSTED.timestamp())
-    assert bot.extract_entry(msg("on fill, latest <t:%d>" % (posted + HOUR)), 3).on_fill
-    early = bot.extract_entry(msg("<t:%d> or on fill" % (posted - 60)), 3)
+    assert extract_entry(msg("on fill, latest <t:%d>" % (posted + HOUR)), 3).on_fill
+    early = extract_entry(msg("<t:%d> or on fill" % (posted - 60)), 3)
     assert early.timestamp == posted - 60 and not early.on_fill
 
 
 # --- forwards ---
 
 def test_forward_reads_snapshot_and_links_to_original():
-    entry = bot.extract_entry(msg(mid=60, snapshots=[snapshot("Event <t:2000000000:F>")], reference=FORWARD), 3)
+    entry = extract_entry(msg(mid=60, snapshots=[snapshot("Event <t:2000000000:F>")], reference=FORWARD), 3)
     assert entry.forwarded and entry.timestamp == 2000000000
     assert entry.url == "https://discord.com/channels/777/888/999"
-    assert "fwd by <@42>" in bot.render_entry(entry)
+    assert "fwd by <@42>" in render_entry(entry)
 
 
 def test_forward_with_embed():
-    entry = bot.extract_entry(msg(snapshots=[snapshot(embeds=[discord.Embed(description="on fill")])], reference=FORWARD), 3)
+    entry = extract_entry(msg(snapshots=[snapshot(embeds=[discord.Embed(description="on fill")])], reference=FORWARD), 3)
     assert entry.on_fill and entry.forwarded
 
 
 def test_reply_is_not_a_forward():
     reply = discord.MessageReference(message_id=1, channel_id=2, guild_id=3)
-    entry = bot.extract_entry(msg("reply <t:2000000000>", 62, reference=reply), 3)
+    entry = extract_entry(msg("reply <t:2000000000>", 62, reference=reply), 3)
     assert not entry.forwarded and entry.url.endswith("/62")
 
 
@@ -195,7 +207,7 @@ def test_reply_is_not_a_forward():
 
 LAYOUT = [{"type": 17, "id": 1, "accent_color": 7501311, "components": [
     {"type": 9, "id": 2, "components": [{"type": 10, "id": 3, "content":
-        "<@&1543590281096724600>" + bot.BRAILLE_BLANK * 30
+        "<@&1543590281096724600>" + BRAILLE_BLANK * 30
         + "\n**NoE CM Prog**\nCommander: <@201706773365784577>\nStarting time: On Fill\nDuration: 1hr"}],
      "accessory": {"type": 11, "id": 4, "media": {"url": "https://example.com/x.png"}}},
     {"type": 14, "id": 5, "spacing": 1, "divider": True},
@@ -209,14 +221,14 @@ def layout_components():
 
 
 def test_forwarded_layout_post():
-    entry = bot.extract_entry(msg(snapshots=[snapshot(components=layout_components())], reference=FORWARD), 3)
+    entry = extract_entry(msg(snapshots=[snapshot(components=layout_components())], reference=FORWARD), 3)
     assert entry is not None and entry.on_fill and entry.forwarded
     assert entry.preview.splitlines()[0] == "**NoE CM Prog**"
-    assert bot.BRAILLE_BLANK not in entry.preview
+    assert BRAILLE_BLANK not in entry.preview
 
 
 def test_direct_layout_post():
-    entry = bot.extract_entry(msg(components=layout_components()), 3)
+    entry = extract_entry(msg(components=layout_components()), 3)
     assert entry is not None and entry.on_fill and not entry.forwarded
 
 

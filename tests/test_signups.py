@@ -9,10 +9,13 @@ from types import SimpleNamespace as NS
 
 import discord
 
-from bot import (
-    Config, Entry, HaskhaBot, Mapping, MappingConfig, find_emotes, format_signups, signup_emojis, signup_rows,
-)
+from haskhabot import signups
+from haskhabot.bot import HaskhaBot
 from conftest import FakeChannel
+from haskhabot.events import Entry
+from haskhabot.mapping import Mapping
+from haskhabot.settings import Config, MappingConfig
+from haskhabot.signups import find_emotes, format_signups, signup_emojis, signup_rows
 
 SHIELD = "\U0001f6e1️"
 HEART = "\U0001f49a"
@@ -41,14 +44,16 @@ def fake_message(content, *, reference=None, reactions=(), fail=(), channel_id=1
     )
 
 
-def client_for(*pairs, add_reactions=True):
+def client_for(*pairs, add_reactions=True, reaction_channels=None):
     """A built HaskhaBot for (source, list) pairs whose source channels do or don't grant Add Reactions.
 
     Returns the client and its channels dict, which tests can change to simulate permission changes.
     """
     channels = {s: FakeChannel(f"src{s}", **VISIBLE, add_reactions=add_reactions) for s, _ in pairs}
+    for c in reaction_channels or ():
+        channels.setdefault(c, FakeChannel(f"react{c}", **VISIBLE, add_reactions=add_reactions))
     config = Config(token="x", mappings=tuple(MappingConfig(s, l) for s, l in pairs), preview_lines=3,
-                    history_limit=None, keep_seconds=0)
+                    history_limit=None, keep_seconds=0, reaction_channels=reaction_channels)
     client = HaskhaBot(config)
     client.get_channel = channels.get
     client.build()
@@ -212,9 +217,7 @@ def test_deleting_a_post_forgets_its_emotes():
 
 
 def test_emote_memory_is_bounded(monkeypatch):
-    import bot
-
-    monkeypatch.setattr(bot, "REACTION_MEMORY", 3)
+    monkeypatch.setattr(signups, "REACTION_MEMORY", 3)
     client, _ = client_for((1, 2))
     for mid in range(1, 6):
         send(client, fake_message(f"{EVENT} {SHIELD}", mid=mid))
@@ -274,6 +277,26 @@ def test_missing_add_reactions_in_one_source_only_affects_that_source():
     send(client, b := fake_message(f"{EVENT} {HEART}", mid=6, channel_id=4))
     assert a.calls == [SHIELD] and b.calls == []
     assert {5, 6} <= lists(client)[3].entries.keys()  # both still listed
+
+
+# --- reaction channels are independent of watched sources ---
+
+def test_reaction_channels_can_exclude_a_watched_source():
+    client, _ = client_for((1, 2), reaction_channels=())
+    send(client, message := fake_message(f"{EVENT} {SHIELD}", mid=5))
+    assert message.calls == [] and 5 in lists(client)[2].entries  # listed, not reacted to
+    edit(client, edited := fake_message(f"{EVENT} {SHIELD} {HEART}", mid=5))
+    assert edited.calls == [] and lists(client)[2].entries[5].message_id == 5
+
+
+def test_reaction_channels_can_include_an_unwatched_channel():
+    client, _ = client_for((1, 2), reaction_channels=(9,))
+    send(client, other := fake_message(f"{EVENT} {SHIELD}", channel_id=9))
+    send(client, watched := fake_message(f"{EVENT} {SHIELD}", channel_id=1, mid=2))
+    assert other.calls == [SHIELD] and watched.calls == []
+    assert lists(client)[2].entries.keys() == {2}  # channel 9's post isn't listed
+    edit(client, edited := fake_message(f"{EVENT} {SHIELD} {HEART}", channel_id=9))
+    assert edited.calls == [HEART]
 
 
 # --- the optional Add Reactions permission ---
@@ -372,10 +395,13 @@ def test_a_failing_command_sync_does_not_stop_startup():
 def test_no_async_comprehension_inside_another_comprehension():
     """A SyntaxError before Python 3.11, which would stop the whole bot starting; the README promises 3.9+."""
     comps = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-    tree = ast.parse((Path(__file__).resolve().parent.parent / "bot.py").read_text(encoding="utf-8"))
-    for outer in ast.walk(tree):
-        if not isinstance(outer, comps):
-            continue
-        for inner in ast.walk(outer):
-            if inner is not outer and isinstance(inner, comps) and any(g.is_async for g in inner.generators):
-                raise AssertionError(f"bot.py:{inner.lineno}: async comprehension inside a comprehension")
+    sources = list(Path(__file__).resolve().parent.parent.glob("haskhabot/*.py"))
+    assert sources  # the check below would pass vacuously on an empty list
+    for source in sources:
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for outer in ast.walk(tree):
+            if not isinstance(outer, comps):
+                continue
+            for inner in ast.walk(outer):
+                if inner is not outer and isinstance(inner, comps) and any(g.is_async for g in inner.generators):
+                    raise AssertionError(f"{source.name}:{inner.lineno}: async comprehension inside a comprehension")

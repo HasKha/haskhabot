@@ -1,4 +1,4 @@
-"""Tests for mappings loading and event routing. Run with: pytest"""
+"""Tests for config loading and event routing. Run with: pytest"""
 
 import asyncio
 import json
@@ -6,27 +6,36 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from bot import Config, Entry, HaskhaBot, Mapping, MappingConfig, group_by_list, read_mappings
+from haskhabot.bot import HaskhaBot
+from haskhabot.settings import Config, MappingConfig, group_by_list, read_config_file
+from haskhabot.events import Entry
+from haskhabot.mapping import Mapping
 
 
 @pytest.fixture
-def load(tmp_path):
-    """read_mappings against a file holding `data` (str written as-is, else JSON), or no file if None."""
+def load_file(tmp_path):
+    """read_config_file against a file holding `data` (str written as-is, else JSON), or no file if None."""
 
-    def load(data, env=None):
-        path = tmp_path / "mappings.json"
+    def load_file(data, env=None):
+        path = tmp_path / "config.json"
         if data is not None:
             path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
-        return read_mappings(path, env or {})
+        return read_config_file(path, env or {})
 
-    return load
+    return load_file
+
+
+@pytest.fixture
+def load(load_file):
+    """Just the mappings, from a file whose "mappings" is `data` (None: no file)."""
+    return lambda data, env=None: load_file(None if data is None else {"mappings": data}, env)[0]
 
 
 def config(*mappings):
     return Config(token="x", mappings=mappings, preview_lines=3, history_limit=None, keep_seconds=0)
 
 
-# --- mappings.json ---
+# --- config.json ---
 
 def test_valid_file(load):
     assert load([{"source": 1, "list": 2}, {"source": 3, "list": 4}]) == (MappingConfig(1, 2), MappingConfig(3, 4))
@@ -51,31 +60,69 @@ def test_invalid_combinations(load, data, message):
 
 
 @pytest.mark.parametrize("data, message", [
-    ("[{", "not valid JSON"),
-    ({"source": 1, "list": 2}, "non-empty list"),
-    ([], "non-empty list"),
+    ({"source": 1, "list": 2}, "non-empty \"mappings\" list"),
+    ([], "non-empty \"mappings\" list"),
     ([{"source": 1, "list": 2}, {"source": 3}], "entry 2"),
     ([{"source": "1", "list": "2"}], "entry 1"),  # quoted IDs
 ])
-def test_invalid_file(load, data, message):
+def test_invalid_mappings(load, data, message):
     with pytest.raises(ValueError, match=message):
         load(data)
 
 
-def test_utf8_bom_accepted(load):
-    assert load("﻿" + json.dumps([{"source": 1, "list": 2}])) == (MappingConfig(1, 2),)
+@pytest.mark.parametrize("data, message", [
+    ("{[", "not valid JSON"),
+    ([{"source": 1, "list": 2}], 'object with a non-empty "mappings"'),  # the old bare-list format
+    ({"reaction_channels": [1]}, 'object with a non-empty "mappings"'),
+])
+def test_invalid_file(load_file, data, message):
+    with pytest.raises(ValueError, match=message):
+        load_file(data)
+
+
+def test_utf8_bom_accepted(load_file):
+    assert load_file("﻿" + json.dumps({"mappings": [{"source": 1, "list": 2}]}))[0] == (MappingConfig(1, 2),)
 
 
 def test_unreadable_path_is_a_readable_error(tmp_path):
     # Docker creates a directory when bind-mounting a host file that doesn't exist.
-    path = tmp_path / "mappings.json"
+    path = tmp_path / "config.json"
     path.mkdir()
     with pytest.raises(ValueError, match="Can't read"):
-        read_mappings(path, {})
+        read_config_file(path, {})
 
 
 def test_file_wins_over_env(load):
     assert load([{"source": 1, "list": 2}], {"SOURCE_CHANNEL_ID": "5", "LIST_CHANNEL_ID": "6"}) == (MappingConfig(1, 2),)
+
+
+# --- reaction_channels ---
+
+MAPPING = {"source": 1, "list": 2}
+
+
+@pytest.mark.parametrize("extra, expected", [
+    ({}, None),  # unset: react in the sources
+    ({"reaction_channels": []}, ()),  # explicitly none
+    ({"reaction_channels": [1, 9, 9]}, (1, 9)),
+])
+def test_reaction_channels(load_file, extra, expected):
+    assert load_file({"mappings": [MAPPING], **extra})[1] == expected
+
+
+@pytest.mark.parametrize("value, message", [
+    ("1", "list of integer"),
+    (["1"], "list of integer"),
+    ([True], "list of integer"),
+    ([2], "list channel can't get signup reactions: 2"),
+])
+def test_invalid_reaction_channels(load_file, value, message):
+    with pytest.raises(ValueError, match=message):
+        load_file({"mappings": [MAPPING], "reaction_channels": value})
+
+
+def test_env_fallback_reacts_in_the_sources(load_file):
+    assert load_file(None, {"SOURCE_CHANNEL_ID": "5", "LIST_CHANNEL_ID": "6"})[1] is None
 
 
 # --- SOURCE_CHANNEL_ID / LIST_CHANNEL_ID fallback ---
@@ -119,8 +166,8 @@ def test_forget_routes_by_channel():
 
 
 class RecordingMapping:
-    def __init__(self, name):
-        self.name, self.calls = name, []
+    def __init__(self, name, source_ids):
+        self.name, self.source_ids, self.calls = name, source_ids, []
 
     def on_message(self, message):
         self.calls.append(("message", message.id))
@@ -153,7 +200,7 @@ def test_build_groups_lists_and_routes_shared_channels():
 
 def test_client_routes_events_to_every_list_using_the_channel():
     client = HaskhaBot(config(MappingConfig(1, 2), MappingConfig(1, 3), MappingConfig(4, 3)))
-    a, b = RecordingMapping("list 2"), RecordingMapping("list 3")
+    a, b = RecordingMapping("list 2", (1,)), RecordingMapping("list 3", (1, 4))
     r1, r4 = RecordingReactions(), RecordingReactions()
     client.by_channel = {1: [a, b], 2: [a], 3: [b], 4: [b]}
     client.reactions = {1: r1, 4: r4}
