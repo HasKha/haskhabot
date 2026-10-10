@@ -8,10 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 import discord
+import pytest
+from conftest import FakeChannel
 
 from haskhabot import signups
 from haskhabot.bot import HaskhaBot
-from conftest import FakeChannel
 from haskhabot.events import Entry
 from haskhabot.mapping import Mapping
 from haskhabot.settings import Config, MappingConfig
@@ -297,6 +298,15 @@ def test_reaction_channels_can_include_an_unwatched_channel():
     assert lists(client)[2].entries.keys() == {2}  # channel 9's post isn't listed
     edit(client, edited := fake_message(f"{EVENT} {SHIELD} {HEART}", channel_id=9))
     assert edited.calls == [HEART]
+
+
+@pytest.mark.parametrize("reaction_channels, logged", [((1, 9), "#src1, #react9"), ((), "no channels")])
+def test_startup_logs_where_reactions_are_added(caplog, reaction_channels, logged):
+    client, _ = client_for((1, 2), reaction_channels=reaction_channels)
+    client.mappings = []  # nothing to rescan
+    with caplog.at_level(logging.INFO, logger="haskhabot"):
+        asyncio.run(client.on_ready())
+    assert f"Adding signup reactions in: {logged}" in caplog.text
 
 
 # --- the optional Add Reactions permission ---

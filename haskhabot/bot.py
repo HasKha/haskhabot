@@ -62,6 +62,9 @@ class HaskhaBot(discord.Client):
         log.info("Logged in as %s", self.user)
         for reactions in self.reactions.values():
             reactions.check()  # warns now if Add Reactions is missing anywhere
+        channels = (self.get_channel(i) for i in self.reactions)
+        log.info("Adding signup reactions in: %s",
+                 ", ".join(f"#{c.name}" if c else str(i) for i, c in zip(self.reactions, channels)) or "no channels")
         # Concurrently, so a big channel's history scan doesn't delay the other lists.
         await asyncio.gather(*(m.rescan_logged() for m in self.mappings))
 
