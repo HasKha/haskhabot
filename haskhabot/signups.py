@@ -19,7 +19,7 @@ MAX_REACTIONS = 20  # Discord's limit of distinct reactions on one message
 REACTION_MEMORY = 1000  # source posts whose emotes are remembered, to react only to emotes an edit adds
 VARIATION_SELECTOR = "️"
 TAIL_RESERVE = 20  # room kept in a signup line for " …and N more"
-REACTION_PERMISSIONS = ("add_reactions",)  # optional, in the source channel: only signup reactions need it
+REACTION_PERMISSIONS = ("add_reactions",)  # optional, in each reaction channel: only signup reactions need it
 
 
 def find_emotes(text: str) -> list[str]:
@@ -77,37 +77,47 @@ async def signup_rows(message: discord.Message, bot_id: int) -> list[tuple[str, 
     return rows
 
 
-class SourceReactions:
-    """Signup reactions for one source channel. Shared by every list the channel feeds, so each post is
-    reacted to once however many lists it appears in."""
+class ReactionChannel:
+    """Signup reactions in one channel, which may or may not be a source. One per channel, however many
+    lists it feeds, so each post is reacted to once."""
 
-    def __init__(self, client: discord.Client, source_id: int):
+    def __init__(self, client: discord.Client, channel_id: int):
         self.client = client
-        self.source_id = source_id
-        self.label = str(source_id)
-        self.can_react = True  # last known state of the optional Add Reactions permission
+        self.channel_id = channel_id
+        self.label = str(channel_id)
+        self.state = "ok"  # last known state: "ok", "no permission" or "not found"
         # Emotes already handled (reacted, failed or predating the bot) per post, so an edit only reacts
         # with emotes it added. In memory only, bounded to the most recent posts.
         self.seen_emotes: collections.OrderedDict[int, set[str]] = collections.OrderedDict()
+
+    def where(self) -> str:
+        """'#name' for logs, or the ID if the channel can't be found."""
+        channel = self.client.get_channel(self.channel_id)
+        return f"#{channel.name}" if isinstance(channel, discord.abc.GuildChannel) else self.label
 
     def check(self) -> bool:
         """Whether the bot may add reactions in this channel; warns when that changes.
 
         Optional: without it the bot just doesn't react, and everything else keeps working.
         """
-        channel = self.client.get_channel(self.source_id)
-        allowed = isinstance(channel, discord.abc.GuildChannel) and all(
-            getattr(channel.permissions_for(channel.guild.me), name) for name in REACTION_PERMISSIONS
-        )
-        if allowed != self.can_react:
-            where = f"#{channel.name}" if isinstance(channel, discord.abc.GuildChannel) else self.label
-            if allowed:
-                log.info("[%s] Add Reactions permission is back: signup reactions are on again", where)
+        channel = self.client.get_channel(self.channel_id)
+        if not isinstance(channel, discord.abc.GuildChannel):
+            state = "not found"
+        elif all(getattr(channel.permissions_for(channel.guild.me), name) for name in REACTION_PERMISSIONS):
+            state = "ok"
+        else:
+            state = "no permission"
+        if state != self.state:
+            if state == "ok":
+                log.info("[%s] Signup reactions are back on", self.where())
+            elif state == "not found":
+                log.warning("[%s] Reaction channel not found (wrong ID in reaction_channels, or the bot isn't in "
+                            "that server): no signup reactions there. Everything else keeps working.", self.label)
             else:
                 log.warning("[%s] Missing Add Reactions: new posts won't get signup reactions until it's "
-                            "granted. Everything else keeps working.", where)
-        self.can_react = allowed
-        return allowed
+                            "granted. Everything else keeps working.", self.where())
+        self.state = state
+        return state == "ok"
 
     def remember(self, message_id: int, keys: set[str]) -> None:
         self.seen_emotes[message_id] = keys

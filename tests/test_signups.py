@@ -329,7 +329,7 @@ def test_regaining_add_reactions_is_logged_and_reacting_resumes(caplog):
     channels[1] = FakeChannel("src1", **VISIBLE, add_reactions=True)
     with caplog.at_level(logging.INFO, logger="haskhabot"):
         assert client.reactions[1].check() is True
-    assert any("is back" in r.getMessage() for r in caplog.records)
+    assert any("back on" in r.getMessage() for r in caplog.records)
     send(client, message := fake_message(f"{EVENT} {SHIELD}"))
     assert message.calls == [SHIELD]
 
@@ -342,6 +342,26 @@ def test_check_warns_when_add_reactions_is_removed(caplog):
         assert client.reactions[1].check() is False
     assert any("Missing Add Reactions" in r.getMessage() for r in caplog.records)
 
+
+def test_a_reaction_channel_that_isnt_found_says_so(caplog):
+    client, channels = client_for((1, 2), reaction_channels=(404,))
+    del channels[404]  # a wrong ID: get_channel finds nothing
+    with caplog.at_level(logging.WARNING, logger="haskhabot"):
+        assert client.reactions[404].check() is False
+        assert client.reactions[404].check() is False
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1 and "[404] Reaction channel not found" in messages[0]  # once, not per check
+    assert "Add Reactions" not in messages[0]
+
+
+def test_startup_log_leaves_out_channels_that_cant_react(caplog):
+    client, channels = client_for((1, 2), (3, 4), reaction_channels=(1, 3))
+    channels[3] = FakeChannel("src3", **VISIBLE, add_reactions=False)
+    client.mappings = []  # nothing to rescan
+    with caplog.at_level(logging.INFO, logger="haskhabot"):
+        asyncio.run(client.on_ready())
+    assert "Adding signup reactions in: #src1\n" in caplog.text + "\n"
+    assert "[#src3] Missing Add Reactions" in caplog.text
 
 # --- /listsignups ---
 

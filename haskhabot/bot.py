@@ -10,7 +10,7 @@ from discord import app_commands
 
 from .mapping import RETRY_SECONDS, Mapping
 from .settings import Config, group_by_list, load_config
-from .signups import SourceReactions, format_signups, signup_rows
+from .signups import ReactionChannel, format_signups, signup_rows
 
 log = logging.getLogger("haskhabot")
 
@@ -25,11 +25,11 @@ class HaskhaBot(discord.Client):
         self.config = config
         self.mappings: list[Mapping] = []
         self.by_channel: dict[int, list[Mapping]] = {}  # source and list channel ids -> the lists using them
-        self.reactions: dict[int, SourceReactions] = {}  # reaction channel id -> its signup reactions
+        self.reactions: dict[int, ReactionChannel] = {}  # reaction channel id -> its signup reactions
         self.tree = app_commands.CommandTree(self)
 
     def build(self) -> None:
-        """One Mapping per list channel, routing by channel id, and one SourceReactions per reaction channel."""
+        """One Mapping per list channel, routing by channel id, and one ReactionChannel per reaction channel."""
         lists = group_by_list(self.config.mappings)
         self.mappings = [Mapping(self, list_id, sources, self.config) for list_id, sources in lists.items()]
         self.by_channel = {}
@@ -39,7 +39,7 @@ class HaskhaBot(discord.Client):
         react_in = self.config.reaction_channels
         if react_in is None:
             react_in = tuple(dict.fromkeys(pair.source_id for pair in self.config.mappings))
-        self.reactions = {channel_id: SourceReactions(self, channel_id) for channel_id in react_in}
+        self.reactions = {channel_id: ReactionChannel(self, channel_id) for channel_id in react_in}
 
     async def setup_hook(self) -> None:
         # Built here, not in __init__: asyncio.Lock/Event need the running loop on older Pythons.
@@ -60,11 +60,8 @@ class HaskhaBot(discord.Client):
     async def on_ready(self) -> None:
         # Fires again after a full reconnect, so rescanning here also catches anything missed offline.
         log.info("Logged in as %s", self.user)
-        for reactions in self.reactions.values():
-            reactions.check()  # warns now if Add Reactions is missing anywhere
-        channels = (self.get_channel(i) for i in self.reactions)
-        log.info("Adding signup reactions in: %s",
-                 ", ".join(f"#{c.name}" if c else str(i) for i, c in zip(self.reactions, channels)) or "no channels")
+        reacting = [r.where() for r in self.reactions.values() if r.check()]  # check() warns about the rest
+        log.info("Adding signup reactions in: %s", ", ".join(reacting) or "no channels")
         # Concurrently, so a big channel's history scan doesn't delay the other lists.
         await asyncio.gather(*(m.rescan_logged() for m in self.mappings))
 
